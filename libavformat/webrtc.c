@@ -29,6 +29,8 @@
 #include "rtsp.h"
 #include "webrtc.h"
 
+// 1. 函数：webrtc_get_state_name
+// 功能：根据 WebRTC 状态返回对应的状态名称字符串
 static const char* webrtc_get_state_name(const rtcState state)
 {
     switch (state)
@@ -50,6 +52,8 @@ static const char* webrtc_get_state_name(const rtcState state)
     }
 }
 
+// 2. 函数：webrtc_log
+// 功能：将 WebRTC 日志转换为 FFmpeg 日志级别并输出
 static void webrtc_log(const rtcLogLevel rtcLevel, const char *const message)
 {
     int level = AV_LOG_VERBOSE;
@@ -79,6 +83,8 @@ static void webrtc_log(const rtcLogLevel rtcLevel, const char *const message)
     av_log(NULL, level, "[libdatachannel] %s\n", message);
 }
 
+// 3. 函数：webrtc_init_logger
+// 功能：初始化 WebRTC 日志记录器，将 FFmpeg 日志级别映射到 WebRTC 日志级别
 void webrtc_init_logger(void)
 {
     rtcLogLevel level = RTC_LOG_VERBOSE;
@@ -107,6 +113,8 @@ void webrtc_init_logger(void)
     rtcInitLogger(level, webrtc_log);
 }
 
+// 4. 函数：webrtc_generate_media_stream_id
+// 功能：生成唯一的媒体流 ID（UUID 格式）
 int webrtc_generate_media_stream_id(char media_stream_id[37])
 {
     int ret;
@@ -123,6 +131,8 @@ fail:
     return ret;
 }
 
+// 5. 函数：webrtc_create_resource
+// 功能：创建 WebRTC 资源，发送 SDP 提议并处理服务器响应
 int webrtc_create_resource(DataChannelContext*const ctx)
 {
     int ret;
@@ -131,14 +141,14 @@ int webrtc_create_resource(DataChannelContext*const ctx)
     char offer_sdp[SDP_MAX_SIZE] = { 0 };
     char response_sdp[SDP_MAX_SIZE] = { 0 };
 
-    /* set local description */
+    /* 1.1 设置本地描述 */
     if (rtcSetLocalDescription(ctx->peer_connection, "offer") != RTC_ERR_SUCCESS) {
         av_log(ctx->avctx, AV_LOG_ERROR, "Failed to set local description\n");
         ret = AVERROR_EXTERNAL;
         goto fail;
     }
 
-    /* create offer */
+    /* 1.2 获取本地 SDP 提议 */
     ret = rtcGetLocalDescription(ctx->peer_connection, offer_sdp, sizeof(offer_sdp));
     if (ret < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "Failed to get local description\n");
@@ -147,13 +157,13 @@ int webrtc_create_resource(DataChannelContext*const ctx)
     }
     av_log(ctx->avctx, AV_LOG_VERBOSE, "offer_sdp: %s\n", offer_sdp);
 
-    /* alloc the http context */
+    /* 1.3 分配 HTTP 上下文 */
     if ((ret = ffurl_alloc(&h, ctx->avctx->url, AVIO_FLAG_READ_WRITE, NULL)) < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_alloc failed\n");
         goto fail;
     }
 
-    /* set options */
+    /* 1.4 设置 HTTP 请求头 */
     headers = av_asprintf("Content-type: application/sdp\r\n");
     if (ctx->bearer_token) {
         headers = av_asprintf("%sAuthorization: Bearer %s\r\n", headers, ctx->bearer_token);
@@ -163,13 +173,13 @@ int webrtc_create_resource(DataChannelContext*const ctx)
     av_opt_set(h->priv_data, "method", "POST", 0);
     av_opt_set_bin(h->priv_data, "post_data", (uint8_t*)offer_sdp, strlen(offer_sdp), 0);
 
-    /* open the http context */
+    /* 1.5 打开 HTTP 连接 */
     if ((ret = ffurl_connect(h, NULL)) < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_connect failed\n");
         goto fail;
     }
 
-    /* read the server reply */
+    /* 1.6 读取服务器响应 */
     ret = ffurl_read_complete(h, (unsigned char*)response_sdp, sizeof(response_sdp));
     if (ret < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_read_complete failed\n");
@@ -178,18 +188,18 @@ int webrtc_create_resource(DataChannelContext*const ctx)
 
     av_log(ctx->avctx, AV_LOG_VERBOSE, "response: %s\n", response_sdp);
 
-    /* set remote description */
+    /* 1.7 设置远程描述 */
     ret = rtcSetRemoteDescription(ctx->peer_connection, response_sdp, "answer");
     if (ret < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "Failed to set remote description\n");
         goto fail;
     }
 
-    /* save resource location for later use */
+    /* 1.8 保存资源位置 */
     av_opt_get(h->priv_data, "new_location", AV_OPT_SEARCH_CHILDREN, (uint8_t**)&ctx->resource_location);
     av_log(ctx->avctx, AV_LOG_VERBOSE, "resource_location: %s\n", ctx->resource_location);
 
-    /* close the http context */
+    /* 1.9 关闭 HTTP 连接 */
     if ((ret = ffurl_closep(&h)) < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_closep failed\n");
         goto fail;
@@ -206,6 +216,8 @@ fail:
     return ret;
 }
 
+// 6. 函数：webrtc_close_resource
+// 功能：关闭 WebRTC 资源，发送 DELETE 请求释放资源
 int webrtc_close_resource(DataChannelContext*const ctx)
 {
     int ret;
@@ -216,26 +228,26 @@ int webrtc_close_resource(DataChannelContext*const ctx)
         return 0;
     }
 
-    /* alloc the http context */
+    /* 2.1 分配 HTTP 上下文 */
     if ((ret = ffurl_alloc(&h, ctx->resource_location, AVIO_FLAG_READ_WRITE, NULL)) < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_alloc failed\n");
         goto fail;
     }
 
-    /* set options */
+    /* 2.2 设置 HTTP 请求头 */
     if (ctx->bearer_token) {
         headers = av_asprintf("Authorization: Bearer %s\r\n", ctx->bearer_token);
         av_log(ctx->avctx, AV_LOG_VERBOSE, "headers: %s\n", headers);
     }
     av_opt_set(h->priv_data, "method", "DELETE", 0);
 
-    /* open the http context */
+    /* 2.3 打开 HTTP 连接 */
     if ((ret = ffurl_connect(h, NULL)) < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_connect failed\n");
         goto fail;
     }
 
-    /* close the http context */
+    /* 2.4 关闭 HTTP 连接 */
     if ((ret = ffurl_closep(&h)) < 0) {
         av_log(ctx->avctx, AV_LOG_ERROR, "ffurl_close failed\n");
         goto fail;
@@ -250,7 +262,8 @@ fail:
     return ret;
 }
 
-/* callback for receiving data */
+// 7. 函数：webrtc_read
+// 功能：从 WebRTC 数据通道读取数据
 static int webrtc_read(URLContext *h, unsigned char *buf, int size)
 {
     const DataChannelTrack*const ctx = (const DataChannelTrack*const)h->priv_data;
@@ -270,7 +283,8 @@ static int webrtc_read(URLContext *h, unsigned char *buf, int size)
     return size;
 }
 
-/* callback for sending data */
+// 8. 函数：webrtc_write
+// 功能：向 WebRTC 数据通道写入数据
 static int webrtc_write(URLContext *h, const unsigned char *buf, int size)
 {
     const DataChannelTrack*const ctx = (const DataChannelTrack*const)h->priv_data;
@@ -284,12 +298,15 @@ static int webrtc_write(URLContext *h, const unsigned char *buf, int size)
     return size;
 }
 
+// 9. WebRTC URL 协议定义
 static const URLProtocol ff_webrtc_protocol = {
     .name            = "webrtc",
     .url_read        = webrtc_read,
     .url_write       = webrtc_write,
 };
 
+// 10. 函数：webrtc_init_urlcontext
+// 功能：初始化 WebRTC URL 上下文
 int webrtc_init_urlcontext(DataChannelContext*const ctx, int track_idx)
 {
     DataChannelTrack*const track = &ctx->tracks[track_idx];
@@ -307,6 +324,8 @@ int webrtc_init_urlcontext(DataChannelContext*const ctx, int track_idx)
     return 0;
 }
 
+// 11. 函数：webrtc_on_state_change
+// 功能：WebRTC 连接状态变化回调函数
 static void webrtc_on_state_change(int pc, rtcState state, void* ptr)
 {
     DataChannelContext*const ctx = (DataChannelContext*const)ptr;
@@ -315,6 +334,8 @@ static void webrtc_on_state_change(int pc, rtcState state, void* ptr)
     ctx->state = state;
 }
 
+// 12. 函数：webrtc_init_connection
+// 功能：初始化 WebRTC 连接
 int webrtc_init_connection(DataChannelContext *const ctx)
 {
     int ret;
@@ -340,6 +361,8 @@ fail:
     return ret;
 }
 
+// 13. 函数：webrtc_convert_codec
+// 功能：将 FFmpeg 编解码器 ID 转换为 WebRTC 编解码器类型
 int webrtc_convert_codec(enum AVCodecID codec_id, rtcCodec* rtc_codec)
 {
     switch (codec_id)
@@ -376,6 +399,8 @@ int webrtc_convert_codec(enum AVCodecID codec_id, rtcCodec* rtc_codec)
     return 0;
 }
 
+// 14. 函数：webrtc_deinit
+// 功能：释放 WebRTC 相关资源
 void webrtc_deinit(DataChannelContext*const ctx)
 {
     if (ctx->tracks) {
