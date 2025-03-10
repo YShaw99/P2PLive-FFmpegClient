@@ -51,7 +51,71 @@ typedef struct DataChannelContext {
     char* bearer_token;
     int64_t connection_timeout;
     int64_t rw_timeout;
+
+    pthread_t test_p2p_thread_id;
 } DataChannelContext;
+
+
+
+// 定义链表节点结构
+typedef struct PeerConnectionNode {
+    char *remote_id;
+    int pc;                          // 可能是pc、也可能是dc， Wrap(function
+    struct PeerConnectionNode *next;
+} PeerConnectionNode;
+
+typedef struct P2PContext {
+    rtcConfiguration* config;
+    // 4位唯一id
+    char* local_id;
+
+    // 信令服务器
+    int web_socket;
+    char* web_socket_server_address;
+    char* web_socket_server_port;
+    char* web_socket_local_id;
+    char* web_socket_remote_id;
+
+    // pc
+    PeerConnectionNode* peer_connection_caches;
+
+    // dc
+    PeerConnectionNode* data_channel_caches;
+
+} P2PContext;
+
+PeerConnectionNode * findPeerConnectionNodeByRemoteId(PeerConnectionNode *head, const char *remote_id);
+PeerConnectionNode * findPeerConnectionNodeByPC(PeerConnectionNode *head, int pc);
+void addPeerConnectionNodeToList(PeerConnectionNode **head, const char *remote_id, int pc);
+//todo: void addDataChannelNodeToList(PeerConnectionNode **head, const char *remote_id, int pc);
+void deletePeerConnection(PeerConnectionNode *head, const char *remote_id);
+
+void on_ws_open_callback(int web_socket_id, void* ptr);
+void on_ws_close_callback(int web_socket_id, void* ptr);
+void on_ws_error_callback(int web_socket_id, const char *error, void *ptr);
+void on_ws_message_callback(int web_socket_id, const char *message, int size, void *ptr);
+void on_peer_connection_open_callback(int peer_connection_id, void* ptr);
+void on_peer_connection_close_callback(int peer_connection_id, void* ptr);
+void on_peer_connection_error_callback(int peer_connection_id, const char *error, void *ptr);
+void on_peer_connection_message_callback(int peer_connection_id, const char *message, int size, void *ptr);
+void on_pc_local_description_callback(int peer_connection_id, const char *sdp, const char *type, void *ptr);
+void on_pc_local_candidate_callback(int peer_connection_id, const char *cand, const char *mid, void *ptr);
+void on_pc_state_change_callback(int peer_connection_id, rtcState state, void *ptr);
+void on_pc_ice_state_change_callback(int peer_connection_id, rtcIceState state, void *ptr);
+void on_pc_gathering_state_callback(int peer_connection_id, rtcGatheringState state, void *ptr);
+void on_pc_signaling_state_callback(int peer_connection_id, rtcSignalingState state, void *ptr);
+void on_pc_data_channel_callback(int peer_connection_id, int dc, void *ptr);
+void on_pc_track_callback(int peer_connection_id, int tr, void *ptr);
+void on_data_channel_open_callback(int data_channel, void* ptr);
+void on_data_channel_close_callback(int data_channel, void* ptr);
+void on_data_channel_error_callback(int data_channel, const char *error, void *ptr);
+void on_data_channel_message_callback(int data_channel, const char *message, int size, void *ptr);
+
+void *p2p_main(void *arg);
+int init_data_channel(P2PContext* const ctx, int peer_connection, char* remote_id);
+int init_peer_connection(P2PContext* const ctx, char* remote_id);
+int init_ws_resource(P2PContext* const ctx, char* web_socket_server_address, char* web_socket_server_port);
+int p2p_close_resource(P2PContext* const ctx);
 
 #define WEBRTC_OPTIONS(FLAGS, offset) \
     { "bearer_token", "optional Bearer token for authentication and authorization", offset+offsetof(DataChannelContext, bearer_token), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS }, \
