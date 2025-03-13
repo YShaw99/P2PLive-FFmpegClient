@@ -50,7 +50,7 @@ static int whep_read_header(AVFormatContext* avctx)
 
     webrtc_init_logger(); // 初始化 WebRTC 日志记录器
 
-    // 2.1 初始化 WebRTC 连接
+    // 2.1 初始化 WebRTC 连接, 创建 ctx->peer_connection
     ret = webrtc_init_connection(&ctx->data_channel);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to initialize connection\n");
@@ -173,6 +173,7 @@ static int whep_read_header(AVFormatContext* avctx)
             goto fail;
         }
 
+        // 联系        ret = avformat_open_input(&ctx->data_channel.tracks[i].rtp_ctx, "temp.sdp", infmt, &options) 这里ffio_fdopen是什么作用？
         // 2.9.9 打开文件描述符
         ret = ffio_fdopen(&ctx->data_channel.tracks[i].rtp_ctx->pb, ctx->data_channel.tracks[i].rtp_url_context);
         if (ret < 0) {

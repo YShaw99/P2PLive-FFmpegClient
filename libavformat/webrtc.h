@@ -60,7 +60,13 @@ typedef struct DataChannelContext {
 // 定义链表节点结构
 typedef struct PeerConnectionNode {
     char *remote_id;
-    int pc;                          // 可能是pc、也可能是dc， Wrap(function
+    int pc;                          // 可能是pc、也可能是dc、track， Wrap(function
+    //Todo 后续补充的字段
+    // typedef struct
+    // {
+    //     int connected = 0;
+    //     rtcDirection direction = 0;
+    // } TrackStatus;
     struct PeerConnectionNode *next;
 } PeerConnectionNode;
 
@@ -82,6 +88,10 @@ typedef struct P2PContext {
     // dc
     PeerConnectionNode* data_channel_caches;
 
+    // track
+    PeerConnectionNode* track_caches;
+
+    pthread_t test_send_thread_id;
 } P2PContext;
 
 PeerConnectionNode * findPeerConnectionNodeByRemoteId(PeerConnectionNode *head, const char *remote_id);
@@ -110,8 +120,14 @@ void on_data_channel_open_callback(int data_channel, void* ptr);
 void on_data_channel_close_callback(int data_channel, void* ptr);
 void on_data_channel_error_callback(int data_channel, const char *error, void *ptr);
 void on_data_channel_message_callback(int data_channel, const char *message, int size, void *ptr);
+void on_track_open_callback(int track_id, void* ptr);
+void on_track_close_callback(int track_id, void* ptr);
+void on_track_error_callback(int track_id, const char *error, void *ptr);
+void on_track_message_callback(int track_id, const char *message, int size, void *ptr);
 
 void *p2p_main(void *arg);
+void* send_h264_main(void* ctx);
+// int p2p_init_urlcontext();
 int init_data_channel(P2PContext* const ctx, int peer_connection, char* remote_id);
 int init_peer_connection(P2PContext* const ctx, char* remote_id);
 int init_ws_resource(P2PContext* const ctx, char* web_socket_server_address, char* web_socket_server_port);

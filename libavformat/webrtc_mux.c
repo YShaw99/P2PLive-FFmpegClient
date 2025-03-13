@@ -120,7 +120,7 @@ static int whip_init(AVFormatContext* avctx)
             av_log(avctx, AV_LOG_ERROR, "webrtc_init_urlcontext failed\n");
             goto fail;
         }
-
+//xy:Todo:看一下这里的逻辑
         // 3.4.4 打开 RTP 复用器
         ret = ff_rtp_chain_mux_open(&track->rtp_ctx, avctx, stream, track->rtp_url_context, RTP_MAX_PACKET_SIZE, i);
         if (ret < 0) {

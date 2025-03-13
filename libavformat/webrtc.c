@@ -31,6 +31,7 @@
 
 #include <pthread.h>
 
+#include "rtpenc.h"
 #include "cjson/cJSON.h"
 
 // 1. 函数：webrtc_get_state_name
@@ -135,12 +136,265 @@ fail:
     return ret;
 }
 
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/rtpenc_chain.h>
+#include <libavutil/mem.h>
+
+#define RTP_PAYLOAD_TYPE 96
+// #define RTP_MTU_SIZE 1200
+// #define RTP_MAX_PACKET_SIZE 1450
+
+// std::shared_ptr<rtc::Track> track;
+int track = -1;
+// **自定义 RTP 数据回调**
+static int send_rtp_packet(void *opaque, uint8_t *buf, int size) {
+    printf("xy: send_rtp_packet! %p, %d", buf, size);
+    // if (track && track->isOpen()) {
+    //     track->send(reinterpret_cast<const std::byte *>(buf), size);
+    // }
+    if (track > 0)
+    {
+        rtcSendMessage(track, (char*)buf, size);
+    }
+    return size; // 必须返回实际写入的字节数
+}
+
+
+// 7. 函数：webrtc_read
+// 功能：从 WebRTC 数据通道读取数据
+static int p2p_read(URLContext *h, unsigned char *buf, int size)
+{
+    // const DataChannelTrack*const ctx = (const DataChannelTrack*const)h->priv_data;
+
+    //临时写一下
+    int ret;
+
+    ret = rtcReceiveMessage(track, (char*)buf, &size);
+    if (ret == RTC_ERR_NOT_AVAIL) {
+        printf("xy: p2p_read error RTC_ERR_NOT_AVAIL %d\n", ret);
+        return AVERROR(EAGAIN);
+    }
+    else if (ret == RTC_ERR_TOO_SMALL) {
+        printf("xy: p2p_read error RTC_ERR_TOO_SMALL %d\n", ret);
+        return AVERROR_BUFFER_TOO_SMALL;
+    }
+    else if (ret != RTC_ERR_SUCCESS) {
+        printf("xy: p2p_read error !=RTC_ERR_SUCCESS %d\n", ret);
+        // av_log(ctx->avctx, AV_LOG_ERROR, "rtcReceiveMessage failed: %d\n", ret);
+        return AVERROR_EOF;
+    }
+    return size;
+}
+
+// 8. 函数：webrtc_write
+// 功能：向 WebRTC 数据通道写入数据
+static int p2p_write(URLContext *h, const unsigned char *buf, int size)
+{
+    // const DataChannelTrack*const ctx = (const DataChannelTrack*const)h->priv_data;
+    int ret;
+    printf("xy: send_rtp_packet! %p, %d \n", buf, size);
+    ret = rtcSendMessage(track, (const char*)buf, size);
+    if (ret != RTC_ERR_SUCCESS) {
+        printf("xy: p2p_write error !=RTC_ERR_SUCCESS %d\n", ret);
+        // av_log(ctx->avctx, AV_LOG_ERROR, "rtcSendMessage failed: %d\n", ret);
+        return AVERROR_EXTERNAL;
+    }
+    return size;
+}
+
+URLContext* p2p_rtp_url_context = NULL;
+// 9. WebRTC URL 协议定义
+static const URLProtocol ff_p2p_protocol = {
+    .name            = "P2P",
+    .url_read        = p2p_read,
+    .url_write       = p2p_write,
+};
+
+// int p2p_init_urlcontext() {
+//     // DataChannelTrack*const track = &ctx->tracks[track_idx];
+//
+//     p2p_rtp_url_context = av_mallocz(sizeof(URLContext));
+//     if (!p2p_rtp_url_context) {
+//         return AVERROR(ENOMEM);
+//     }
+//
+//     p2p_rtp_url_context->prot = &ff_p2p_protocol;
+//     p2p_rtp_url_context->priv_data = NULL;
+//     p2p_rtp_url_context->max_packet_size = RTP_MAX_PACKET_SIZE;
+//     p2p_rtp_url_context->flags = AVIO_FLAG_READ_WRITE;
+//     p2p_rtp_url_context->rw_timeout = 10000000;//ctx->rw_timeout;
+//     return 0;
+// }
+/*
+void* send_h264_main(void* arg)
+{
+    avformat_network_init();
+
+    AVFormatContext *fmt_ctx = NULL;
+    AVCodecContext *codec_ctx = NULL;
+    AVPacket *pkt = av_packet_alloc();
+
+    // **打开本地 H.264 文件**
+    const char *input_file = "/Users/shaw/Downloads/test.h264";
+    if (avformat_open_input(&fmt_ctx, input_file, NULL, NULL) < 0) {
+        printf("无法打开输入文件");
+        return NULL;
+    }
+    if (avformat_find_stream_info(fmt_ctx, NULL) < 0) {
+        printf("无法获取流信息");
+        return NULL;
+    }
+
+    // **查找 H.264 视频流**
+    AVStream *video_stream = NULL;
+    for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_stream = fmt_ctx->streams[i];
+            break;
+        }
+    }
+    if (!video_stream) {
+        printf("未找到视频流");
+        return NULL;
+    }
+
+    // **初始化 H.264 解码器**
+    AVCodec *codec = avcodec_find_decoder(video_stream->codecpar->codec_id);
+    if (!codec) {
+        printf("找不到解码器");
+        return NULL;
+    }
+
+    codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_ctx, video_stream->codecpar);
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
+        printf("无法打开解码器");
+        return NULL;
+    }
+
+    // 2.1 rtp output format ctx
+    AVFormatContext *rtp_output_ctx = NULL;
+    AVOutputFormat *rtp_format = av_guess_format("rtp", NULL, NULL);
+    if (!rtp_format) {
+        printf("无法找到 RTP 格式");
+        return NULL;
+    }
+    if (avformat_alloc_output_context2(&rtp_output_ctx, rtp_format, "rtp", NULL) < 0) {
+        printf("无法分配 RTP 输出上下文");
+        return NULL;
+    }
+
+    // 2.2 rtp stream
+    AVStream *rtp_stream = avformat_new_stream(rtp_output_ctx, codec);
+    avcodec_parameters_copy(rtp_stream->codecpar, video_stream->codecpar);
+    avpriv_set_pts_info(rtp_stream, 32, 1, 90000); // 设置视频时间戳信息 COPY FROM WEBRTC MUX
+
+
+
+    // **自定义 AVIO 设备**
+    //2.3  rtp_output_ctx->AVIO, 但好像没用，先改成自定义的临时urlctx  TODO
+    // p2p_init_urlcontext();
+    p2p_rtp_url_context = av_mallocz(sizeof(URLContext));
+    if (!p2p_rtp_url_context) {
+        // return AVERROR(ENOMEM);
+        assert(false);
+    }
+
+    p2p_rtp_url_context->prot = &ff_p2p_protocol;
+    p2p_rtp_url_context->priv_data = NULL;
+    p2p_rtp_url_context->max_packet_size = RTP_MAX_PACKET_SIZE;
+    p2p_rtp_url_context->flags = AVIO_FLAG_READ_WRITE;
+    p2p_rtp_url_context->rw_timeout = 10000000;//ctx->rw_timeout;
+    // AVIOContext *avio_ctx = NULL;
+    // uint8_t *buffer = NULL;
+    // int buffer_size = 4096;
+    //
+    // buffer = (uint8_t *)(av_malloc(buffer_size));
+    // avio_ctx = avio_alloc_context(buffer, buffer_size, 1, NULL, NULL, send_rtp_packet, NULL);
+    // rtp_output_ctx->pb = avio_ctx;
+
+    // **初始化 RTP Muxer**
+    struct AVFormatContext *rtp_send_ctx = NULL;
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "payload_type", "96", 0);
+    av_dict_set(&opts, "ssrc", "123456", 0);
+
+    if (ff_rtp_chain_mux_open(&rtp_send_ctx, rtp_output_ctx, rtp_stream, p2p_rtp_url_context, RTP_MAX_PACKET_SIZE, 0) < 0) {
+        printf("RTP Muxer 初始化失败");
+        return NULL;
+    }
+    av_dict_free(&opts);
+    // rtp_mux_ctx->pb = avio_ctx;//temp
+
+    // **读取并发送 H.264 RTP 数据**
+    while (av_read_frame(fmt_ctx, pkt) >= 0) {
+        if (pkt->stream_index != video_stream->index) {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        ff_rtp_send_data(rtp_send_ctx, pkt->data, pkt->size, 0);
+
+        av_packet_unref(pkt);
+    }
+
+    // **释放资源**
+    // ff_rtp_chain_mux_close(&rtp_mux_ctx);
+    // avformat_close_input(&fmt_ctx);
+    // avcodec_free_context(&codec_ctx);
+    // avformat_free_context(rtp_ctx);
+    // av_packet_free(&pkt);
+    // av_free(avio_ctx);
+
+    return 0;
+}
+*/
+
+
+
+void* send_h264_main(void* arg)
+{
+    P2PContext* ctx = (P2PContext*)arg;
+        const char *filename = "/Users/shaw/Downloads/test.h264";
+        AVFormatContext *fmt_ctx = NULL;
+        AVPacket pkt;
+
+        avformat_network_init();
+
+        // 打开 H.264 裸流
+        if (avformat_open_input(&fmt_ctx, filename, NULL, NULL) < 0) {
+            fprintf(stderr, "Could not open file %s\n", filename);
+            return NULL;
+        }
+
+        // 读取每一帧
+        static int i=0;
+        while (av_read_frame(fmt_ctx, &pkt) >= 0) {
+            PeerConnectionNode* current = ctx->data_channel_caches; // track_caches
+            while(current)
+            {
+                printf("Read frame of size %d\n", pkt.size);
+                rtcSendMessage(current->pc, pkt.data, pkt.size);
+                current = current->next;
+            }
+            av_packet_unref(&pkt);
+        }
+
+        avformat_close_input(&fmt_ctx);
+        avformat_network_deinit();
+    return NULL;
+}
+
 // 5. 函数：webrtc_create_resource
 // 功能：创建 WebRTC 资源，发送 SDP 提议并处理服务器响应
+// 简单地说就是 rtcSetLocalDescription offer、rtcGetLocalDescription给对方发过去。
+// 然后从http拿到对方的answer，然后SetRemoteDescription。
 int webrtc_create_resource(DataChannelContext*const ctx)
 {
 
     pthread_create(&ctx->test_p2p_thread_id, NULL, p2p_main, NULL);
+
     // pthread_detach(ctx->test_p2p_thread_id);
 
     sleep(1000);
@@ -413,7 +667,7 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
 // -------- peer connect callback(common) --------
 void on_peer_connection_open_callback(int peer_connection_id, void* ptr)
 {
-    printf("[FFmpegP2P][PeerConnection] connected | peer_connection_id: %d\n", peer_connection_id);
+    printf("[FFmpegP2P][PeerConnection] open | peer_connection_id: %d\n", peer_connection_id);
 }
 
 void on_peer_connection_close_callback(int peer_connection_id, void* ptr)
@@ -505,7 +759,7 @@ void on_pc_local_candidate_callback(int peer_connection_id, const char *cand, co
 }
 
 void on_pc_state_change_callback(int peer_connection_id, rtcState state, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] pc state change to %d \n", state);
+    printf("[FFmpegP2P][PeerConnection] pc state change to %s \n", webrtc_get_state_name(state));
 }
 void on_pc_ice_state_change_callback(int peer_connection_id, rtcIceState state, void *ptr) {
     printf("[FFmpegP2P][PeerConnection] on_pc_ice_state_change_callback | %d \n", state);
@@ -537,7 +791,7 @@ void on_pc_data_channel_callback(int peer_connection_id, int dc, void *ptr) {
 
 }
 void on_pc_track_callback(int peer_connection_id, int tr, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] ");
+    printf("[FFmpegP2P][PeerConnection] on_pc_track_callback | ");
 }
 
 // -------- dc callback --------
@@ -548,6 +802,8 @@ void on_data_channel_open_callback(int data_channel, void* ptr)
     PeerConnectionNode* node = findPeerConnectionNodeByPC(ctx->data_channel_caches, data_channel);
     //Todo: 这里没有做datachannel有效性检测，并且size=-1是以字符串发送，而非binary
     rtcSendMessage(data_channel, "Hello from 1", -1);
+    track = ctx->track_caches->pc;//TODO: 这里只是简单的取第一个track，做测试用
+    pthread_create(&ctx->test_send_thread_id, NULL, send_h264_main, ctx);
 }
 
 void on_data_channel_close_callback(int data_channel, void* ptr)
@@ -589,17 +845,84 @@ int init_ws_resource(P2PContext* const ctx, char* web_socket_server_address, cha
     return web_socket;
 }
 
+
+// -------- Track callback(common) --------
+void on_track_open_callback(int track_id, void* ptr)
+{
+    printf("[FFmpegP2P][Track] open | track_id: %d\n", track_id);
+}
+
+void on_track_close_callback(int track_id, void* ptr)
+{
+    printf("[FFmpegP2P][Track] close | track_id: %d\n", track_id);
+}
+
+void on_track_error_callback(int track_id, const char *error, void *ptr)
+{
+    printf("[FFmpegP2P][Track] error | error: %s, track_id: %d\n", error, track_id);
+}
+
+void on_track_message_callback(int track_id, const char *message, int size, void *ptr)
+{
+    printf("[FFmpegP2P][Track] message! track_id: %d, message: %s \n", track_id, message);
+}
+
 int init_peer_connection(P2PContext* const ctx, char* remote_id)
 {
     int peer_connection = rtcCreatePeerConnection(ctx->config);
     addPeerConnectionNodeToList(&ctx->peer_connection_caches, remote_id, peer_connection);
 
+  //   rtcSSrc
+		// const rtc::SSRC ssrc = 42;
+		// rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
+		// media.addH264Codec(96); // Must match the payload type of the external h264 RTP stream
+		// media.addSSRC(ssrc, "video-send");
+		// auto track = pc->addTrack(media);
+
+
+
+    // 3.4.5 配置 WebRTC 轨道初始化参数
+    rtcTrackInit track_init;
+    memset(&track_init, 0, sizeof(rtcTrackInit));
+    track_init.direction = RTC_DIRECTION_SENDONLY; // 仅发送方向
+    track_init.payloadType = 96; //"rtp_mux_ctx->payload_type"; // 负载类型
+    track_init.ssrc = 42; // SSRC
+    track_init.mid = "video"; // 媒体 ID
+    track_init.name = "LIBAVFORMAT_IDENT"; // 轨道名称
+    track_init.msid = "media_stream_id"; // 媒体流 ID
+    track_init.trackId = "trackId";//av_asprintf("%s-video-%d", media_stream_id, i); // 轨道 ID
+
+
+    static const char *test_media_description = "video 9 UDP/TLS/RTP/SAVPF\r\n"
+                                          "a=mid:video\r\n"
+                                          "a=sendonly\r\n";
+    int track = rtcAddTrackEx(peer_connection, &track_init);
+    addPeerConnectionNodeToList(&ctx->track_caches, remote_id, track);
+    rtcSetOpenCallback(track, on_track_open_callback);
+    rtcSetErrorCallback(track, on_track_error_callback);
+    rtcSetClosedCallback(track, on_track_close_callback);
+    rtcSetMessageCallback(track, on_track_message_callback);
+    // 只是一些检查
+    char mid[256];
+    if (rtcGetTrackMid(track, mid, 256) < 0 || strcmp(mid, "video") != 0) {
+        fprintf(stderr, "rtcGetTrackMid failed\n");
+        goto error;
+    }
+
+    rtcDirection direction;
+    if (rtcGetTrackDirection(track, &direction) < 0 || direction != RTC_DIRECTION_SENDONLY) {
+        fprintf(stderr, "rtcGetTrackDirection failed\n");
+        goto error;
+    }
+
+    // Initiate the handshake
+
     rtcSetUserPointer(peer_connection, ctx);
     // common
-    rtcSetOpenCallback(peer_connection, on_peer_connection_open_callback);
-    rtcSetErrorCallback(peer_connection, on_peer_connection_error_callback);
-    rtcSetClosedCallback(peer_connection, on_peer_connection_close_callback);
-    rtcSetMessageCallback(peer_connection, on_peer_connection_message_callback);
+    // rtcSetOpenCallback(peer_connection, on_peer_connection_open_callback);
+    // rtcSetErrorCallback(peer_connection, on_peer_connection_error_callback);
+    // rtcSetClosedCallback(peer_connection, on_peer_connection_close_callback);
+    // rtcSetMessageCallback(peer_connection, on_peer_connection_message_callback);
     // only pc
     rtcSetLocalDescriptionCallback(peer_connection, on_pc_local_description_callback);
     rtcSetLocalCandidateCallback(peer_connection, on_pc_local_candidate_callback);
@@ -613,6 +936,9 @@ int init_peer_connection(P2PContext* const ctx, char* remote_id)
 
     init_data_channel(ctx, peer_connection, remote_id);
     return 0;
+  error:
+    assert(false);
+    return -1;
 }
 
 int init_data_channel(P2PContext* const ctx, int peer_connection, char* remote_id)
@@ -652,6 +978,7 @@ void *p2p_main(void *arg)
     sleep(2);
     char* remote_id = "recv";
     init_peer_connection(ctx, remote_id);
+    sleep(10000);
     // //Todo后续改为cond
     // bool exit = 0;
     // while(exit==false)
