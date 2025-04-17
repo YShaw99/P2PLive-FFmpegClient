@@ -3,64 +3,126 @@
 //
 #include "p2p_pc.h"
 #include "p2p_dc.h"
-
-int init_peer_connection(P2PContext* const ctx, char* remote_id)
-{
-    int peer_connection = rtcCreatePeerConnection(ctx->config);
-    add_peer_connection_node_to_list(&ctx->peer_connection_caches, remote_id, peer_connection);
-
-    rtcSetUserPointer(peer_connection, ctx);
-    // common
-    rtcSetOpenCallback(peer_connection, on_peer_connection_open_callback);
-    rtcSetErrorCallback(peer_connection, on_peer_connection_error_callback);
-    rtcSetClosedCallback(peer_connection, on_peer_connection_close_callback);
-    rtcSetMessageCallback(peer_connection, on_peer_connection_message_callback);
-    // only pc
-    rtcSetLocalDescriptionCallback(peer_connection, on_pc_local_description_callback);
-    rtcSetLocalCandidateCallback(peer_connection, on_pc_local_candidate_callback);
-    rtcSetStateChangeCallback(peer_connection, on_pc_state_change_callback);
-    rtcSetIceStateChangeCallback(peer_connection, on_pc_ice_state_change_callback);
-    rtcSetGatheringStateChangeCallback(peer_connection, on_pc_gathering_state_callback);
-    rtcSetSignalingStateChangeCallback(peer_connection, on_pc_signaling_state_callback);
-    // pc with dc
-    rtcSetDataChannelCallback(peer_connection, on_pc_data_channel_callback);
+#include "p2p_ws.h"
+#include <unistd.h>
+#include <libavutil/time.h>
 
 
-    init_data_channel(ctx, peer_connection, remote_id);
+int p2p_init_signal_server(P2PContext* const ctx) {
+    rtcConfiguration* config = malloc(sizeof(rtcConfiguration));
+    memset(config, 0, sizeof(config));
+    config->iceServersCount = 1;
+    config->iceServers = (char*[]){"stun:stun.l.google.com:19302"};
+    ctx->config = config;
+    ctx->local_id = "send";
+
+    const char* web_socket_server_address = "120.53.223.132";
+    const char* web_socket_server_port = "8000";
+    init_ws_resource(ctx, web_socket_server_address, web_socket_server_port);
+
+    //我方主动建联的测试
+    while(ctx->web_socket_connected == 0) {
+        av_usleep(1000); //等待ws连接成功 //xy:ToDo:Temp: 应该改成一个阻塞机制，可以放到回调函数里，设置超时时间。
+    }
     return 0;
 }
 
-// -------- peer connect callback(common) --------
-void on_peer_connection_open_callback(int peer_connection_id, void* ptr)
-{
-    printf("[FFmpegP2P][PeerConnection] connected | peer_connection_id: %d\n", peer_connection_id);
-}
+int init_peer_connection(P2PContext* const ctx, const char* remote_id) {
+    if (ctx == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+    int ret;
+    int peer_connection;
+    rtcConfiguration* config = ctx->config;
 
-void on_peer_connection_close_callback(int peer_connection_id, void* ptr)
-{
-    printf("[FFmpegP2P][PeerConnection] close | peer_connection_id: %d\n", peer_connection_id);
-}
+    if ((peer_connection = rtcCreatePeerConnection(config)) <= 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to create PeerConnection\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
 
-void on_peer_connection_error_callback(int peer_connection_id, const char *error, void *ptr)
-{
-    printf("[FFmpegP2P][PeerConnection] error | error: %s, peer_connection_id: %d\n", error, peer_connection_id);
-}
+    PeerConnectionNode* pc_node = av_mallocz(sizeof(PeerConnectionNode));
+    if (pc_node == NULL) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate PeerConnectionNode\n");
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    pc_node->avctx = ctx->avctx;
+    pc_node->status = Disconnected;     //xy:ToDo: 3期实现NetWorkTest状态
+    pc_node->pc_id = peer_connection;
+    av_log(ctx->avctx, AV_LOG_INFO, "init local pc id: %d\n", peer_connection);
+    pc_node->remote_id = remote_id;
+    pc_node->p2p_ctx = ctx;
+    append_peer_connection_node_to_list(&ctx->peer_connection_node_caches, pc_node);
 
-void on_peer_connection_message_callback(int peer_connection_id, const char *message, int size, void *ptr)
-{
-    printf("[FFmpegP2P][PeerConnection] message! peer_connection_id: %d, message: %s \n", peer_connection_id, message);
+    rtcSetUserPointer(peer_connection, pc_node);
+    // only pc
+    ret = rtcSetLocalDescriptionCallback(peer_connection, on_pc_local_description_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetLocalDescriptionCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    ret = rtcSetLocalCandidateCallback(peer_connection, on_pc_local_candidate_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetLocalCandidateCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    ret = rtcSetStateChangeCallback(peer_connection, on_pc_state_change_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetStateChangeCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    ret = rtcSetIceStateChangeCallback(peer_connection, on_pc_ice_state_change_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetIceStateChangeCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    ret = rtcSetGatheringStateChangeCallback(peer_connection, on_pc_gathering_state_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetGatheringStateChangeCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    ret = rtcSetSignalingStateChangeCallback(peer_connection, on_pc_signaling_state_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetSignalingStateChangeCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    // pc with dc
+    ret = rtcSetDataChannelCallback(peer_connection, on_pc_data_channel_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetDataChannelCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    ret = rtcSetTrackCallback(peer_connection, on_pc_track_callback);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to rtcSetTrackCallback\n");
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+
+    return 0;
+fail:
+    rtcDeletePeerConnection(peer_connection);
+    abort();
+    return ret;
 }
 
 // -------- peer connect callback(pc only) --------
 //这代表我方主动建连
 void on_pc_local_description_callback(int peer_connection_id, const char *sdp, const char *type, void *ptr) {
-    P2PContext* ctx = ptr;
-    PeerConnectionNode* node = find_peer_connection_node_by_pc(ctx->peer_connection_caches, peer_connection_id);
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+    int ret;
 
-    printf("[FFmpegP2P][PeerConnection] local_description | peer_connection_id: %d, sdp: %s, type: %s \n",
-        peer_connection_id,
-        sdp,
-        type);
+    av_log(ctx->avctx, AV_LOG_DEBUG, "peer_connection(local id: %d with remote id: %s) local description set (type=%s)\n", peer_connection_id, node->remote_id, type);
 
     cJSON* message = cJSON_CreateObject();
     if (message == NULL) {
@@ -81,23 +143,20 @@ void on_pc_local_description_callback(int peer_connection_id, const char *sdp, c
     }
     size_t size = strlen(json_str);
     // 通过 WebSocket 发送 JSON 数据
-    rtcSendMessage(ctx->web_socket, json_str, size);
-
-    // 释放内存
+    ret = rtcSendMessage(ctx->web_socket, json_str, size);
+    if (ret < 0) {
+        // av_log();
+    }
+end:
     free(json_str);
     cJSON_Delete(message);
 }
 
 void on_pc_local_candidate_callback(int peer_connection_id, const char *cand, const char *mid, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] local_candidate\n");
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
 
-    P2PContext* ctx = ptr;
-    PeerConnectionNode* node = find_peer_connection_node_by_pc(ctx->peer_connection_caches, peer_connection_id);
-
-    printf("[FFmpegP2P][PeerConnection] local_candidate | peer_connection_id: %d, cand: %s, mid: %s \n",
-        peer_connection_id,
-        cand,
-        mid);
+    av_log(ctx->avctx, AV_LOG_DEBUG, "peer_connection(local id: %d with remote id: %s) local ICE candidate (mid=%s)\n", peer_connection_id, node->remote_id, mid);
 
     cJSON* message = cJSON_CreateObject();
     if (message == NULL) {
@@ -120,42 +179,181 @@ void on_pc_local_candidate_callback(int peer_connection_id, const char *cand, co
     size_t size = strlen(json_str);
     rtcSendMessage(ctx->web_socket, json_str, size);
 
+end:
     free(json_str);
     cJSON_Delete(message);
 }
 
-void on_pc_state_change_callback(int peer_connection_id, rtcState state, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] pc state change to %d \n", state);
+static const char* webrtc_get_state_name(const rtcState state)
+{
+    switch (state)
+    {
+    case RTC_NEW:
+        return "RTC_NEW";
+    case RTC_CONNECTING:
+        return "RTC_CONNECTING";
+    case RTC_CONNECTED:
+        return "RTC_CONNECTED";
+    case RTC_DISCONNECTED:
+        return "RTC_DISCONNECTED";
+    case RTC_FAILED:
+        return "RTC_FAILED";
+    case RTC_CLOSED:
+        return "RTC_CLOSED";
+    default:
+        return "UNKNOWN";
+    }
 }
-void on_pc_ice_state_change_callback(int peer_connection_id, rtcIceState state, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] on_pc_ice_state_change_callback | %d \n", state);
-}
-void on_pc_gathering_state_callback(int peer_connection_id, rtcGatheringState state, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] on_pc_gathering_state_callback | %d \n", state);
-}
-void on_pc_signaling_state_callback(int peer_connection_id, rtcSignalingState state, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] on_pc_signaling_state_callback | %d \n", state);
-}
-void on_pc_data_channel_callback(int peer_connection_id, int dc, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] data_channel_callback | \n");
-    P2PContext* ctx = ptr;
 
-    //无论是主动还是被动，前面应该已经调用过init_data_channel了，这里只做一下查询，如果没有再调用一遍
-    if (find_peer_connection_node_by_pc(ctx->data_channel_caches, dc) == NULL) {
+static const char* webrtc_get_ice_state_name(const rtcIceState state) {
+    switch (state) {
+    case RTC_ICE_NEW:
+        return "RTC_ICE_NEW";
+    case RTC_ICE_CHECKING:
+        return "RTC_ICE_CHECKING";
+    case RTC_ICE_CONNECTED:
+        return "RTC_ICE_CONNECTED";
+    case RTC_ICE_COMPLETED:
+        return "RTC_ICE_COMPLETED";
+    case RTC_ICE_FAILED:
+        return "RTC_ICE_FAILED";
+    case RTC_ICE_DISCONNECTED:
+        return "RTC_ICE_DISCONNECTED";
+    case RTC_ICE_CLOSED:
+        return "RTC_ICE_CLOSED";
+    default:
+        return "RTC_ICE_UNKNOWN";
+    }
+}
+static const char* webrtc_get_gathering_state_name(const rtcGatheringState state) {
+    switch (state) {
+    case RTC_GATHERING_NEW:
+        return "RTC_GATHERING_NEW";
+    case RTC_GATHERING_INPROGRESS:
+        return "RTC_GATHERING_INPROGRESS";
+    case RTC_GATHERING_COMPLETE:
+        return "RTC_GATHERING_COMPLETE";
+    default:
+        return "RTC_GATHERING_UNKNOWN";
+    }
+}
+static const char* webrtc_get_signaling_state_name(const rtcSignalingState state)
+{
+    switch (state) {
+    case RTC_SIGNALING_STABLE:
+        return "RTC_SIGNALING_STABLE";
+    case RTC_SIGNALING_HAVE_LOCAL_OFFER:
+        return "RTC_SIGNALING_HAVE_LOCAL_OFFER";
+    case RTC_SIGNALING_HAVE_REMOTE_OFFER:
+        return "RTC_SIGNALING_HAVE_REMOTE_OFFER";
+    case RTC_SIGNALING_HAVE_LOCAL_PRANSWER:
+        return "RTC_SIGNALING_HAVE_LOCAL_PRANSWER";
+    case RTC_SIGNALING_HAVE_REMOTE_PRANSWER:
+        return "RTC_SIGNALING_HAVE_REMOTE_PRANSWER";
+    default:
+        return "RTC_SIGNALING_UNKNOWN";
+    }
+}
+
+void on_pc_state_change_callback(int peer_connection_id, rtcState state, void *ptr) {
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+
+    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) state changed to %s\n", peer_connection_id, node->remote_id, webrtc_get_state_name(state));
+
+    switch (state) {
+    case RTC_NEW:
+        node->status = Disconnected;  // 新建状态视为未连接
+        break;
+    case RTC_CONNECTING:
+        node->status = Connecting;    // 直接对应
+        break;
+    case RTC_CONNECTED:
+        node->status = Connected;     // 直接对应
+        break;
+    case RTC_DISCONNECTED:
+        node->status = Disconnected;  // 直接对应
+        break;
+    case RTC_FAILED:
+        node->status = Failed;        // 直接对应
+        break;
+    case RTC_CLOSED:
+        node->status = Completed;     // 关闭视为完成（或Disconnected，根据业务需求）
+        break;
+    default:
+        node->status = Disconnected;  // 默认处理
+        break;
+    }
+    //xy:TODO:optimize: 根据状态进行处理：
+    // - 断线重连
+    // - 释放资源
+    // - 触发上层回调
+}
+
+void on_pc_ice_state_change_callback(int peer_connection_id, rtcIceState state, void *ptr) {
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+
+    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) ICE state changed to %s\n", peer_connection_id, node->remote_id, webrtc_get_ice_state_name(state));
+
+    //xy:TODO:optimize 根据 ICE 状态进行处理：
+    // - 当 ICE 完成时，建立媒体流
+    // - 处理 ICE 失败情况（尝试重连或切换网络）
+}
+
+
+void on_pc_gathering_state_callback(int peer_connection_id, rtcGatheringState state, void *ptr) {
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+
+    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) gathering state changed to %s\n", peer_connection_id, node->remote_id, webrtc_get_gathering_state_name(state));
+
+    //xy:TODO:optimize 可以在 `Complete` 状态时上报 ICE 候选信息
+}
+
+void on_pc_signaling_state_callback(int peer_connection_id, rtcSignalingState state, void *ptr) {
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+
+    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) signaling state changed to %s\n", peer_connection_id, node->remote_id, webrtc_get_signaling_state_name(state));
+
+    //xy:TODO:optimize 根据信令状态：
+    // - 发送 Offer/Answer
+    // - 检查是否需要重新协商（Renegotiation）
+}
+
+void on_pc_data_channel_callback(int peer_connection_id, int data_channel_id, void *ptr) {
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+
+    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) new data channel established (dc_id=%d)\n", peer_connection_id, node->remote_id, data_channel_id);
+
+    //xy:TODO:optimize 可以初始化数据通道，设置消息回调
+
+    //无论是主动还是被动，前面应该已经调用过init_data_channel了，这里只做一下查询，如果没有再调用一遍初始化
+    if (find_peer_connection_track_by_track_id(node->track_caches, data_channel_id) == NULL) {
         printf("data_channel_callback | [warning]⚠️ pc in dc caches is not found！ create new！！！\n");
-        PeerConnectionNode *node = find_peer_connection_node_by_pc(ctx->peer_connection_caches, peer_connection_id);
-        if(node == NULL)
-        {
-            assert(false);
-            return;
-        }
-        init_data_channel(ctx, peer_connection_id, node->remote_id);
+        // PeerConnectionNode * = find_peer_connection_node_by_pc(ctx->peer_connection_node_caches, peer_connection_id);
+        // if(node == NULL)
+        // {
+        //     assert(false);
+        //     return;
+        // }
+        init_track(node, node->remote_id);
     } else
     {
-        printf("data_channel_callback | pc in dc caches is found！ reuse\n");
+        av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) found the channel in caches! (dc_id=%d)\n", peer_connection_id, node->remote_id, data_channel_id);
     }
 
 }
+
 void on_pc_track_callback(int peer_connection_id, int tr, void *ptr) {
-    printf("[FFmpegP2P][PeerConnection] ");
+    PeerConnectionNode *node = ptr;
+    P2PContext *ctx = node->p2p_ctx;
+
+    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) new track received (track_id=%d)\n", peer_connection_id, node->remote_id, tr);
+
+    //xy:TODO:optimize 处理 Track，例如：
+    // - 绑定到播放器或录制模块
+    // - 创建新的音视频解码器
 }

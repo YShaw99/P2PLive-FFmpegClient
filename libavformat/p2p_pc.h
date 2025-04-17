@@ -20,6 +20,7 @@ void on_pc_signaling_state_callback(int peer_connection_id, rtcSignalingState st
 void on_pc_data_channel_callback(int peer_connection_id, int dc, void *ptr);
 void on_pc_track_callback(int peer_connection_id, int tr, void *ptr);
 
-int init_peer_connection(P2PContext* const ctx, char* remote_id);
+int p2p_init_signal_server(P2PContext* const ctx);
+int init_peer_connection(P2PContext* const ctx, const char* remote_id);
 
 #endif //P2P_PC_H
