@@ -51,6 +51,8 @@ typedef struct DataChannelContext {
     char* bearer_token;
     int64_t connection_timeout;
     int64_t rw_timeout;
+
+    pthread_t test_p2p_thread_id;
 } DataChannelContext;
 
 #define WEBRTC_OPTIONS(FLAGS, offset) \
