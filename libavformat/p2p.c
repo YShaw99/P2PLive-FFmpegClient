@@ -4,89 +4,80 @@
 
 #include "p2p.h"
 
-/**
- * @brief 根据 id 查找对应的 PeerConnection
- *
- * @param id 字符串 id
- * @return 如果找到返回对应的 pc，否则返回 -1
- */
-PeerConnectionNode * find_peer_connection_node_by_remote_id(PeerConnectionNode *head, const char *remote_id) {
-    PeerConnectionNode *current = head;
-    while (current != NULL) {
-        if (strcmp(current->remote_id, remote_id) == 0) {
-            return current;
-        }
-        current = current->next;
+PeerConnectionNode* find_peer_connection_node_by_remote_id(PeerConnectionNode *head, const char *remote_id) {
+    while (head) {
+        if (head->remote_id && strcmp(head->remote_id, remote_id) == 0)
+            return head;
+        head = head->next;
     }
     return NULL;
 }
 
-PeerConnectionNode * find_peer_connection_node_by_pc(PeerConnectionNode *head, int pc) {
-    PeerConnectionNode *current = head;
-    while (current != NULL) {
-        if (current->pc == pc) {
-            return current;
-        }
-        current = current->next;
+PeerConnectionNode* find_peer_connection_node_by_pc_id(PeerConnectionNode *head, int pc_id) {
+    while (head) {
+        if (head->pc_id == pc_id)
+            return head;
+        head = head->next;
     }
     return NULL;
 }
 
-/**
- * @brief 向链表中添加新的映射项
- *
- * @param id 字符串 id
- * @param pc 对应的 PeerConnection（这里为 int）
- */
-void add_peer_connection_node_to_list(PeerConnectionNode **head, const char *remote_id, int pc) {
-    // 检查是否已存在
-    if (find_peer_connection_node_by_remote_id(*head, remote_id) != NULL) {
-        printf("id %s 已存在，更新映射\n", remote_id);
-        // 如果需要更新已有项，可在这里遍历找到对应节点并更新 pc
-        PeerConnectionNode *current = *head;
-        while (current != NULL) {
-            if (strcmp(current->remote_id, remote_id) == 0) {
-                current->pc = pc;
-                return;
-            }
-            current = current->next;
+int release_peer_connection_node(PeerConnectionNode* node)
+{
+    if (node->remote_id != NULL)
+        free(node->remote_id);
+    //xy:TODO:release: 关于连接关闭，有哪些要做的工作？
+    //清空p2p连接
+    //清空datachannels连接
+    //清空tracks的连接
+    return 0;
+}
+
+int remove_peer_connection_node_from_list(PeerConnectionNode **head, const char *remote_id) {
+    if (head == NULL || remote_id == NULL)
+        return AVERROR_INVALIDDATA;
+
+    PeerConnectionNode *prev = NULL, *curr = *head;
+    while (curr) {
+        if (curr->remote_id && strcmp(curr->remote_id, remote_id) == 0) {
+            if (prev)
+                prev->next = curr->next;
+            else
+                *head = curr->next;
+
+            // 释放节点内存
+            release_peer_connection_node(curr);
+            free(curr);
+            return 0;
         }
+        prev = curr;
+        curr = curr->next;
     }
 
-    // 创建新的节点
-    PeerConnectionNode *newNode = malloc(sizeof(PeerConnectionNode));
-    if (!newNode) {
-        fprintf(stderr, "内存分配失败\n");
-        exit(EXIT_FAILURE);
-    }
-    newNode->remote_id = strdup(remote_id);  // 复制 id 字符串
-    newNode->pc = pc;
-    newNode->next = *head;      // 新节点插入到链表头
-    *head = newNode;
+    return 0;
 }
-/**
- * @brief 删除链表中某个 id 对应的映射项
- *
- * @param id 字符串 id
- */
-void delete_peer_connection_node_in_list(PeerConnectionNode *head, const char *remote_id) {
-    PeerConnectionNode *current = head, *prev = NULL;
-    while (current != NULL) {
-        if (strcmp(current->remote_id, remote_id) == 0) {
-            if (prev == NULL) {  // 删除头节点
-                head = current->next;
-            } else {
-                prev->next = current->next;
-            }
-            free(current->remote_id);
-            free(current);
-            printf("删除 id: %s 的映射\n", remote_id);
-            return;
-        }
-        prev = current;
-        current = current->next;
+
+int append_peer_connection_node_to_list(PeerConnectionNode **head, PeerConnectionNode *new_node) {
+    if (!new_node)
+        return AVERROR_INVALIDDATA;
+    int ret = 0;
+
+    if (find_peer_connection_node_by_remote_id(*head, new_node->remote_id)) {
+        if (ret = remove_peer_connection_node_from_list(head, new_node->remote_id))
+            return ret;
     }
-    printf("未找到 id: %s\n", remote_id);
+
+    if (*head == NULL) {
+        *head = new_node;
+    } else {
+        PeerConnectionNode *tail = *head;
+        while (tail->next) {
+            tail = tail->next;
+        }
+        tail->next = new_node;
+    }
+
+    return 0;
 }
 
 //Todo：这里后面直接写入muxer，然后封装改造p2p_create_resource
