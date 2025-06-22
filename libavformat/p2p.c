@@ -23,7 +23,6 @@ int p2p_close_resource(P2PContext* const ctx) {
 
 // ---------
 static int p2p_rtp_read(URLContext *h, unsigned char *buf, int size) {
-    printf("p2p_rtp_read");
     const PeerConnectionTrack * const track = (const PeerConnectionTrack * const)h->priv_data;
     int ret;
 
@@ -57,7 +56,7 @@ static const URLProtocol ff_p2p_rtp_protocol = {
     .url_write       = p2p_rtp_write,
 };
 
-int p2p_rtp_init_urlcontext(PeerConnectionNode*const node, PeerConnectionTrack * const track) {
+int p2p_rtp_init_urlcontext(PeerConnectionTrack * const track) {
     track->rtp_url_context = av_mallocz(sizeof(URLContext));
     if (track->rtp_url_context == NULL) {
         return AVERROR(ENOMEM);
@@ -101,6 +100,7 @@ int release_peer_connection_node(PeerConnectionNode* node) {
     //清空p2p连接
     //清空datachannels连接
     //清空tracks的连接
+    //清空config下所有字符串内存
     return 0;
 }
 

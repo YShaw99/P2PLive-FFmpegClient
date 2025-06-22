@@ -5,16 +5,32 @@
 #include "p2p_dc.h"
 #include "p2p_ws.h"
 #include <unistd.h>
+#include "rtpenc.h"
+#include "webrtc.h"
+#include "rtsp.h"
 #include <libavutil/time.h>
 
 
 int p2p_init_signal_server(P2PContext* const ctx) {
     rtcConfiguration* config = malloc(sizeof(rtcConfiguration));
     memset(config, 0, sizeof(config));
-    config->iceServersCount = 1;
-    config->iceServers = (char*[]){"stun:stun.l.google.com:19302"};
+    char* iceServers[] = {
+        "stun:stun.l.google.com:19302",
+        NULL
+    };
+    config->iceServersCount = sizeof(iceServers) / sizeof(iceServers[0]);
+    config->iceServers = (char**)malloc(config->iceServersCount * sizeof(char*));
+    if (config->iceServers == NULL) {
+    }
+    for (int i = 0; i < config->iceServersCount; i++) {
+        config->iceServers[i] = strdup(iceServers[i]);
+        if (config->iceServers[i] == NULL) {
+            abort();
+        }
+    }
+
+
     ctx->config = config;
-    ctx->local_id = "send";
 
     const char* web_socket_server_address = "120.53.223.132";
     const char* web_socket_server_port = "8000";
@@ -51,7 +67,7 @@ int init_peer_connection(P2PContext* const ctx, const char* remote_id) {
     pc_node->status = Disconnected;     //xy:ToDo: 3期实现NetWorkTest状态
     pc_node->pc_id = peer_connection;
     av_log(ctx->avctx, AV_LOG_INFO, "init local pc id: %d\n", peer_connection);
-    pc_node->remote_id = remote_id;
+    pc_node->remote_id = strdup(remote_id); //xy:todo:free
     pc_node->p2p_ctx = ctx;
     append_peer_connection_node_to_list(&ctx->peer_connection_node_caches, pc_node);
 
@@ -339,7 +355,9 @@ void on_pc_data_channel_callback(int peer_connection_id, int data_channel_id, vo
         //     assert(false);
         //     return;
         // }
-        init_track(node, node->remote_id);
+        abort();
+        //deprecated
+        // init_track(node, node->remote_id);
     } else
     {
         av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) found the channel in caches! (dc_id=%d)\n", peer_connection_id, node->remote_id, data_channel_id);
@@ -349,10 +367,71 @@ void on_pc_data_channel_callback(int peer_connection_id, int data_channel_id, vo
 
 void on_pc_track_callback(int peer_connection_id, int tr, void *ptr) {
     PeerConnectionNode *node = ptr;
-    P2PContext *ctx = node->p2p_ctx;
+    P2PContext *p2p_ctx = node->p2p_ctx;
+    rtcTrackInit track_init = {0};
+    AVDictionary* options = NULL;
+    const AVInputFormat* infmt;
+    FFIOContext sdp_pb;
+    int ret = 0;
+    av_log(p2p_ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) new track received (track_id=%d)\n", peer_connection_id, node->remote_id, tr);
 
-    av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) new track received (track_id=%d)\n", peer_connection_id, node->remote_id, tr);
+    rtcDirection direct;
+    rtcGetTrackDirection(tr, &direct);
+    if (direct == RTC_DIRECTION_RECVONLY || direct == RTC_DIRECTION_SENDRECV) {
+        // char ssrc[1024] = {};
+        // ret = rtcGetSsrcsForTrack(tr, ssrc, 1024);//这个时候是没有ssrc的
+        // av_log(ctx->avctx, AV_LOG_INFO, "ssrc is %s\n", ssrc);
 
+        char sdp[1024] = {};
+        ret = rtcGetTrackDescription(tr, sdp, sizeof(sdp));
+        av_log(p2p_ctx->avctx, AV_LOG_INFO, "sdp is %s\n", sdp);
+
+        char codec[1024] = {};
+        char buffer[1024] = {};
+        ret = rtcGetTrackPayloadTypesForCodec(tr,codec, buffer, sizeof(buffer));
+        av_log(p2p_ctx->avctx, AV_LOG_INFO, "type is %s %s\n", codec, buffer);
+
+        PeerConnectionTrack *track = av_malloc(sizeof(PeerConnectionTrack));
+        track->track_id = tr;
+        node->video_track = track;//debug临时试一下
+        // track->avctx = p2p_ctx->avctx;
+        // track->rtp_ctx = avformat_alloc_context();
+        // if (!track->rtp_ctx) {
+        //     av_log(p2p_ctx->avctx, AV_LOG_ERROR, "Failed to allocate RTP context\n");
+        //     abort();
+        //     return;
+        // }
+        // track->rtp_ctx->max_delay = track->avctx->max_delay;
+        // track->rtp_ctx->interrupt_callback = track->avctx->interrupt_callback;
+        //
+        //
+        // // 4. 初始化 SDP 文件的 IO 上下文
+        // char sdp_track[SDP_MAX_SIZE] = { 0 };
+        // ret = rtcGetTrackDescription(track->track_id, sdp_track, sizeof(sdp_track));
+        // if (ret < 0) abort();
+        // ffio_init_read_context(&sdp_pb, (uint8_t*)sdp_track, strlen(sdp_track));
+        // track->rtp_ctx->pb = &sdp_pb.pub;
+        //
+        // // 5. 设置 SDP 选项, 打开 SDP 输入
+        // av_dict_set(&options, "sdp_flags", "custom_io", 0);
+        // infmt = av_find_input_format("sdp");
+        // ret = avformat_open_input(&track->rtp_ctx, "temp.sdp", infmt, &options);
+        // if (ret < 0) {
+        //     av_log(p2p_ctx->avctx, AV_LOG_ERROR, "avformat_open_input failed\n");
+        //     return;
+        // }
+        //
+        // // 6. 打开文件描述符, 什么作用？
+        // ret = ffio_fdopen(&track->rtp_ctx->pb, track->rtp_url_context);
+        // if (ret < 0) {
+        //     av_log(p2p_ctx->avctx, AV_LOG_ERROR, "ffio_fdopen failed\n");
+        //     return;
+        // }
+
+        append_peer_connection_track_to_list(&node->track_caches, track);
+
+    }
+    p2p_ctx->waiting_for_sender = 0;
     //xy:TODO:optimize 处理 Track，例如：
     // - 绑定到播放器或录制模块
     // - 创建新的音视频解码器

@@ -70,7 +70,8 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
         cJSON_Delete(message_json);
         return;
     }
-    char* remote_id = remote_id_json->valuestring;
+    char remote_id[1024] = {};
+    strcpy(remote_id, remote_id_json->valuestring);
 
     cJSON* type_json = cJSON_GetObjectItem(message_json, "type");
     if(!cJSON_IsString(type_json) || type_json->valuestring == NULL) {
@@ -106,9 +107,9 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
             goto end;
         }
         node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, remote_id);
+        // ctx->waiting_for_sender = 0;
     } else if (node == NULL) {
         // 如果没有连接，且类型不是 offer，则直接返回
-        cJSON_Delete(message_json);
         goto end;
     }
 

@@ -52,6 +52,8 @@ typedef struct PeerConnectionNode {
     // NetworkQuality NetworkQualityWhenInit;   //xy:Todo:如何动态更新P2P的网络状态？
     P2PConnectionStatus status;
     PeerConnectionTrack* track_caches;
+    PeerConnectionTrack* video_track;
+    PeerConnectionTrack* audio_track;
     struct PeerConnectionNode *next;
 } PeerConnectionNode;
 
@@ -72,11 +74,13 @@ typedef struct P2PContext {
     PeerConnectionNode* peer_connection_node_caches;
     PeerConnectionNode* selected_node;
 
+    int waiting_for_sender; // debug,当前没办法阻塞等待，recv端先设置一个flag，启动后一直等待send端连接
+
 } P2PContext;
 
 void *p2p_main(void *arg);
 int p2p_close_resource(P2PContext* const ctx);
-int p2p_rtp_init_urlcontext(PeerConnectionNode*const node, PeerConnectionTrack * const track);
+int p2p_rtp_init_urlcontext(PeerConnectionTrack * const track);
 
 int append_peer_connection_node_to_list(PeerConnectionNode **head, PeerConnectionNode *new_node);
 int remove_peer_connection_node_from_list(PeerConnectionNode **head, const char *remote_id);

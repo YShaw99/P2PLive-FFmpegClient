@@ -44,10 +44,11 @@ static int p2p_rtp_muxer_init(AVFormatContext* avctx) {
     int ret;
 
     p2p_ctx->avctx = avctx;
+    char* local_id = strdup("send");    //xy:TODO:dev: id应该有一套生成规则，可以根据STUN拿到本地的IP，然后生成一个
+    p2p_ctx->local_id = local_id;
 
     // 1.连接信令服务器
-    ret = p2p_init_signal_server(p2p_ctx);
-    if(ret < 0) {
+    if ((ret = p2p_init_signal_server(p2p_ctx)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to connect signal server\n");
         ret = AVERROR(ENOTCONN);
         goto fail;
@@ -55,7 +56,6 @@ static int p2p_rtp_muxer_init(AVFormatContext* avctx) {
 
     // 2. Nodes
     //xy:ToDo:dev: 2期主动mock 远端的id。3期修改为从服务器分发合适的id
-    const char* local_id = strdup("send");    //xy:TODO:dev: id应该有一套生成规则，可以根据STUN拿到本地的IP，然后生成一个
     const char *remote_ids[] = {
         "recv"
         /*, "recv2"*/
@@ -107,7 +107,7 @@ static int p2p_rtp_muxer_init(AVFormatContext* avctx) {
                     continue;
             }
 
-            ret = init_track_ex(avctx, stream, node, track, j);
+            ret = init_send_track_ex(avctx, stream, node, track, j);
             if (ret < 0) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to add track\n");
                 ret = AVERROR(EINVAL);
@@ -191,7 +191,7 @@ static int p2p_rtp_muxer_check_bitstream(AVFormatContext *s, AVStream *st, const
 
 static int p2p_rtp_muxer_write_packet(AVFormatContext* avctx, AVPacket* pkt) {
     //xy:休息回来继续从这里入手，记录一下已经连接的那个peer，然后开始发送消息
-    //排查一下为什么没有调用track on open
+    //排查一下为什么没有调用track on open//已经发送成功，demo已经可以收到128类型的消息，直接写一个ffmpeg recv 让他能够demux并播放
     P2PRtpMuxContext*const rtp_mux_context = (P2PRtpMuxContext*const)avctx->priv_data;
     P2PContext*const p2p_context = &rtp_mux_context->p2p_context;
     PeerConnectionNode* node = p2p_context->selected_node;
@@ -236,6 +236,10 @@ static int p2p_rtp_muxer_write_packet(AVFormatContext* avctx, AVPacket* pkt) {
 
 }
 static int p2p_rtp_muxer_write_trailer(AVFormatContext* avctx) {
+    //ff在这里只是做了 webrtc close resource
+    // 里面调用了HTTP请求
+    // av_opt_set(h->priv_data, "method", "DELETE", 0);
+
     return 0;
 }
 
