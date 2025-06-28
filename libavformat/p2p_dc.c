@@ -1,6 +1,9 @@
 //
 // Created by Shaw on 2025/3/4.
 //
+
+// Todo: 代码封装不够整洁，后续优化
+
 #include "p2p_dc.h"
 
 #include <libavutil/avstring.h>
@@ -11,6 +14,7 @@
 #include "rtpenc.h"
 #include "rtpenc_chain.h"
 #include "rtsp.h"
+#include "version.h"
 
 static int setup_send_track(AVFormatContext* avctx,
                             AVStream* stream,
@@ -277,4 +281,12 @@ void on_track_error_callback(int track_id, const char *error, void *ptr) {
 
 void on_track_message_callback(int track_id, const char *message, int size, void *ptr) {
     printf("[FFmpegP2P][Track] message! track: %d, message: %s \n", track_id, message);
+    
+    // PeerConnectionNode *node = ptr;
+    // if (!node) return;
+    //
+    // // 检查是否是探测数据包
+    // if (size == sizeof(ProbePacket)) {
+    //     handle_probe_packet(node, message, size);
+    // }
 }

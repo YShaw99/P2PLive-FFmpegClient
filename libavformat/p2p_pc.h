@@ -6,6 +6,7 @@
 #define P2P_PC_H
 
 #include "p2p.h"
+#include "p2p_signal.h"
 
 void on_peer_connection_open_callback(int peer_connection_id, void* ptr);
 void on_peer_connection_close_callback(int peer_connection_id, void* ptr);

@@ -3,12 +3,8 @@
 //
 
 #include "p2p.h"
-#define RTP_MAX_PACKET_SIZE 1450 //xy:TODO:这是哪里的
-
-//Todo：这里后面直接写入muxer，然后封装改造p2p_create_resource
-void *p2p_main(void *arg) {
-    return NULL;
-}
+#include "avio.h"
+#include "url.h"
 
 int p2p_close_resource(P2PContext* const ctx) {
     // // 清理
@@ -64,7 +60,7 @@ int p2p_rtp_init_urlcontext(PeerConnectionTrack * const track) {
 
     track->rtp_url_context->prot = &ff_p2p_rtp_protocol;
     track->rtp_url_context->priv_data = track;
-    track->rtp_url_context->max_packet_size = RTP_MAX_PACKET_SIZE;
+    track->rtp_url_context->max_packet_size = P2P_RTP_MAX_PACKET_SIZE;
     track->rtp_url_context->flags = AVIO_FLAG_READ_WRITE;
     //xy:ToDo: options
     track->rtp_url_context->rw_timeout = INT_MAX;// ctx->rw_timeout;

@@ -57,7 +57,8 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
     printf("[FFmpegP2P][WebSocket] message! web_socket_id: %d, message: %s \n", web_socket_id, message);
 
     P2PContext* ctx = (P2PContext*)ptr;
-    int ret;
+    /*
+        int ret;
     cJSON* message_json = cJSON_Parse(message);
     if (message_json == NULL) {
         printf("[FFmpegP2P][WebSocket] message JSON parse error! Raw message: %s\n", message);
@@ -86,12 +87,11 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
     char* json_string = cJSON_Print(message_json);
     printf("[FFmpegP2P][WebSocket] on_ws_message_callback | msg_json: %s, msg: %s\n",
            json_string ? json_string : "null", message);
-    free(json_string);  // 释放 cJSON_Print 生成的字符串
+    free(json_string);
 
     // 查找或创建 PeerConnection
     PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, remote_id);
     if (node == NULL && strcmp(type, "offer") == 0) {
-/*
         //xy:Todo:对方offer的时候，不能重建且覆盖，否则会崩溃，暂时没有捋顺该逻辑。但目前注释之后跑通了。
         // 收到 offer 表示对方主动连接，新建 PeerConnection
         ret = rtcDeletePeerConnection(node->pc_id);
@@ -99,7 +99,6 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
             abort();
         }
         //track收不到回调的问题，这里通过更新pc重试！
-        */
         ret = init_peer_connection(ctx, remote_id);
         if(ret != 0)
         {
@@ -135,6 +134,12 @@ void on_ws_message_callback(int web_socket_id, const char *message, int size, vo
         }
     }
 
-    end:
+end:
     cJSON_Delete(message_json);
+    */
+    // 使用新的信令消息处理函数
+    int ret = p2p_handle_signal_message(ctx, message, size);
+    if (ret < 0) {
+        printf("[FFmpegP2P][WebSocket] Failed to handle signal message: %d\n", ret);
+    }
 }

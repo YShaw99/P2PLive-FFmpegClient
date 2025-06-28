@@ -136,36 +136,25 @@ fail:
 void on_pc_local_description_callback(int peer_connection_id, const char *sdp, const char *type, void *ptr) {
     PeerConnectionNode *node = ptr;
     P2PContext *ctx = node->p2p_ctx;
-    int ret;
 
     av_log(ctx->avctx, AV_LOG_DEBUG, "peer_connection(local id: %d with remote id: %s) local description set (type=%s)\n", peer_connection_id, node->remote_id, type);
 
-    cJSON* message = cJSON_CreateObject();
-    if (message == NULL) {
-        fprintf(stderr, "无法创建 JSON 对象\n");
-        return;
+    // 使用新的信令消息结构发送 SDP
+    P2PSignalMessage msg = {0};
+    msg.id = ctx->local_id;
+    
+    if (strcmp(type, "offer") == 0) {
+        msg.type = P2P_MSG_OFFER;
+        msg.payload.offer.description = (char*)sdp;
+    } else if (strcmp(type, "answer") == 0) {
+        msg.type = P2P_MSG_ANSWER;
+        msg.payload.answer.description = (char*)sdp;
     }
-
-    cJSON_AddStringToObject(message, "id", node->remote_id);
-    cJSON_AddStringToObject(message, "type", type);
-    cJSON_AddStringToObject(message, "description", sdp);
-
-    // 将 JSON 对象转换为紧凑字符串
-    char* json_str = cJSON_PrintUnformatted(message);
-    if (json_str == NULL) {
-        fprintf(stderr, "无法生成 JSON 字符串\n");
-        cJSON_Delete(message);
-        return;
-    }
-    size_t size = strlen(json_str);
-    // 通过 WebSocket 发送 JSON 数据
-    ret = rtcSendMessage(ctx->web_socket, json_str, size);
+    
+    int ret = p2p_send_signal_message(ctx, &msg);
     if (ret < 0) {
-        // av_log();
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to send %s message\n", type);
     }
-end:
-    free(json_str);
-    cJSON_Delete(message);
 }
 
 void on_pc_local_candidate_callback(int peer_connection_id, const char *cand, const char *mid, void *ptr) {
@@ -174,100 +163,87 @@ void on_pc_local_candidate_callback(int peer_connection_id, const char *cand, co
 
     av_log(ctx->avctx, AV_LOG_DEBUG, "peer_connection(local id: %d with remote id: %s) local ICE candidate (mid=%s)\n", peer_connection_id, node->remote_id, mid);
 
-    cJSON* message = cJSON_CreateObject();
-    if (message == NULL) {
-        fprintf(stderr, "无法创建 JSON 对象\n");
-        return;
+    // 使用新的信令消息结构发送 ICE candidate
+    P2PSignalMessage msg = {0};
+    msg.type = P2P_MSG_CANDIDATE;
+    msg.id = ctx->local_id;
+    msg.payload.candidate.candidate = (char*)cand;
+    msg.payload.candidate.mid = (char*)mid;
+    
+    int ret = p2p_send_signal_message(ctx, &msg);
+    if (ret < 0) {
+        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to send candidate message\n");
     }
-
-    cJSON_AddStringToObject(message, "id", node->remote_id);
-    cJSON_AddStringToObject(message, "type", "candidate");
-    cJSON_AddStringToObject(message, "candidate", cand);
-    cJSON_AddStringToObject(message, "mid", mid);
-
-    char* json_str = cJSON_PrintUnformatted(message);
-    if (json_str == NULL) {
-        fprintf(stderr, "无法生成 JSON 字符串\n");
-        cJSON_Delete(message);
-        return;
-    }
-
-    size_t size = strlen(json_str);
-    rtcSendMessage(ctx->web_socket, json_str, size);
-
-end:
-    free(json_str);
-    cJSON_Delete(message);
 }
 
 static const char* webrtc_get_state_name(const rtcState state)
 {
     switch (state)
     {
-    case RTC_NEW:
-        return "RTC_NEW";
-    case RTC_CONNECTING:
-        return "RTC_CONNECTING";
-    case RTC_CONNECTED:
-        return "RTC_CONNECTED";
-    case RTC_DISCONNECTED:
-        return "RTC_DISCONNECTED";
-    case RTC_FAILED:
-        return "RTC_FAILED";
-    case RTC_CLOSED:
-        return "RTC_CLOSED";
-    default:
-        return "UNKNOWN";
+        case RTC_NEW:
+            return "RTC_NEW";
+        case RTC_CONNECTING:
+            return "RTC_CONNECTING";
+        case RTC_CONNECTED:
+            return "RTC_CONNECTED";
+        case RTC_DISCONNECTED:
+            return "RTC_DISCONNECTED";
+        case RTC_FAILED:
+            return "RTC_FAILED";
+        case RTC_CLOSED:
+            return "RTC_CLOSED";
+        default:
+            return "UNKNOWN";
     }
 }
 
 static const char* webrtc_get_ice_state_name(const rtcIceState state) {
     switch (state) {
-    case RTC_ICE_NEW:
-        return "RTC_ICE_NEW";
-    case RTC_ICE_CHECKING:
-        return "RTC_ICE_CHECKING";
-    case RTC_ICE_CONNECTED:
-        return "RTC_ICE_CONNECTED";
-    case RTC_ICE_COMPLETED:
-        return "RTC_ICE_COMPLETED";
-    case RTC_ICE_FAILED:
-        return "RTC_ICE_FAILED";
-    case RTC_ICE_DISCONNECTED:
-        return "RTC_ICE_DISCONNECTED";
-    case RTC_ICE_CLOSED:
-        return "RTC_ICE_CLOSED";
-    default:
-        return "RTC_ICE_UNKNOWN";
+        case RTC_ICE_NEW:
+            return "RTC_ICE_NEW";
+        case RTC_ICE_CHECKING:
+            return "RTC_ICE_CHECKING";
+        case RTC_ICE_CONNECTED:
+            return "RTC_ICE_CONNECTED";
+        case RTC_ICE_COMPLETED:
+            return "RTC_ICE_COMPLETED";
+        case RTC_ICE_FAILED:
+            return "RTC_ICE_FAILED";
+        case RTC_ICE_DISCONNECTED:
+            return "RTC_ICE_DISCONNECTED";
+        case RTC_ICE_CLOSED:
+            return "RTC_ICE_CLOSED";
+        default:
+            return "RTC_ICE_UNKNOWN";
     }
 }
 static const char* webrtc_get_gathering_state_name(const rtcGatheringState state) {
     switch (state) {
-    case RTC_GATHERING_NEW:
-        return "RTC_GATHERING_NEW";
-    case RTC_GATHERING_INPROGRESS:
-        return "RTC_GATHERING_INPROGRESS";
-    case RTC_GATHERING_COMPLETE:
-        return "RTC_GATHERING_COMPLETE";
-    default:
-        return "RTC_GATHERING_UNKNOWN";
+        case RTC_GATHERING_NEW:
+            return "RTC_GATHERING_NEW";
+        case RTC_GATHERING_INPROGRESS:
+            return "RTC_GATHERING_INPROGRESS";
+        case RTC_GATHERING_COMPLETE:
+            return "RTC_GATHERING_COMPLETE";
+        default:
+            return "RTC_GATHERING_UNKNOWN";
     }
 }
 static const char* webrtc_get_signaling_state_name(const rtcSignalingState state)
 {
     switch (state) {
-    case RTC_SIGNALING_STABLE:
-        return "RTC_SIGNALING_STABLE";
-    case RTC_SIGNALING_HAVE_LOCAL_OFFER:
-        return "RTC_SIGNALING_HAVE_LOCAL_OFFER";
-    case RTC_SIGNALING_HAVE_REMOTE_OFFER:
-        return "RTC_SIGNALING_HAVE_REMOTE_OFFER";
-    case RTC_SIGNALING_HAVE_LOCAL_PRANSWER:
-        return "RTC_SIGNALING_HAVE_LOCAL_PRANSWER";
-    case RTC_SIGNALING_HAVE_REMOTE_PRANSWER:
-        return "RTC_SIGNALING_HAVE_REMOTE_PRANSWER";
-    default:
-        return "RTC_SIGNALING_UNKNOWN";
+        case RTC_SIGNALING_STABLE:
+            return "RTC_SIGNALING_STABLE";
+        case RTC_SIGNALING_HAVE_LOCAL_OFFER:
+            return "RTC_SIGNALING_HAVE_LOCAL_OFFER";
+        case RTC_SIGNALING_HAVE_REMOTE_OFFER:
+            return "RTC_SIGNALING_HAVE_REMOTE_OFFER";
+        case RTC_SIGNALING_HAVE_LOCAL_PRANSWER:
+            return "RTC_SIGNALING_HAVE_LOCAL_PRANSWER";
+        case RTC_SIGNALING_HAVE_REMOTE_PRANSWER:
+            return "RTC_SIGNALING_HAVE_REMOTE_PRANSWER";
+        default:
+            return "RTC_SIGNALING_UNKNOWN";
     }
 }
 
@@ -278,27 +254,27 @@ void on_pc_state_change_callback(int peer_connection_id, rtcState state, void *p
     av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) state changed to %s\n", peer_connection_id, node->remote_id, webrtc_get_state_name(state));
 
     switch (state) {
-    case RTC_NEW:
-        node->status = Disconnected;  // 新建状态视为未连接
-        break;
-    case RTC_CONNECTING:
-        node->status = Connecting;    // 直接对应
-        break;
-    case RTC_CONNECTED:
-        node->status = Connected;     // 直接对应
-        break;
-    case RTC_DISCONNECTED:
-        node->status = Disconnected;  // 直接对应
-        break;
-    case RTC_FAILED:
-        node->status = Failed;        // 直接对应
-        break;
-    case RTC_CLOSED:
-        node->status = Completed;     // 关闭视为完成（或Disconnected，根据业务需求）
-        break;
-    default:
-        node->status = Disconnected;  // 默认处理
-        break;
+        case RTC_NEW:
+            node->status = Disconnected;
+            break;
+        case RTC_CONNECTING:
+            node->status = Connecting;
+            break;
+        case RTC_CONNECTED:
+            node->status = Connected;
+            break;
+        case RTC_DISCONNECTED:
+            node->status = Disconnected;
+            break;
+        case RTC_FAILED:
+            node->status = Failed;
+            break;
+        case RTC_CLOSED:
+            node->status = Closed;
+            break;
+        default:
+            node->status = Disconnected;
+            break;
     }
     //xy:TODO:optimize: 根据状态进行处理：
     // - 断线重连
@@ -312,9 +288,34 @@ void on_pc_ice_state_change_callback(int peer_connection_id, rtcIceState state, 
 
     av_log(ctx->avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) ICE state changed to %s\n", peer_connection_id, node->remote_id, webrtc_get_ice_state_name(state));
 
-    //xy:TODO:optimize 根据 ICE 状态进行处理：
-    // - 当 ICE 完成时，建立媒体流
-    // - 处理 ICE 失败情况（尝试重连或切换网络）
+    // 更新ICE连接状态得分
+    //xy:Todo:review网络质量评分系统
+    switch (state) {
+        case RTC_ICE_NEW:
+            node->network_quality.ice_connectivity_score = 0;
+            break;
+        case RTC_ICE_CHECKING:
+            node->network_quality.ice_connectivity_score = 25;
+            break;
+        case RTC_ICE_CONNECTED:
+            node->network_quality.ice_connectivity_score = 75;
+            break;
+        case RTC_ICE_COMPLETED:
+            node->network_quality.ice_connectivity_score = 100;
+            break;
+        case RTC_ICE_FAILED:
+            node->network_quality.ice_connectivity_score = 0;
+            break;
+        case RTC_ICE_DISCONNECTED:
+            node->network_quality.ice_connectivity_score = 10;
+            break;
+        case RTC_ICE_CLOSED:
+            node->network_quality.ice_connectivity_score = 0;
+            break;
+        default:
+            node->network_quality.ice_connectivity_score = 0;
+            break;
+    }
 }
 
 
