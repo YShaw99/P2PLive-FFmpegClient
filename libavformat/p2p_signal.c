@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "cjson/cJSON.h"
 #include <libavutil/uuid.h>
 #include <libavutil/time.h>
 #include <libavutil/random_seed.h>
@@ -37,8 +38,12 @@ int p2p_send_signal_message(P2PContext* ctx, const P2PSignalMessage* msg) {
         case P2P_MSG_ROOM_JOINED:
             cJSON_AddStringToObject(json, "room_id", msg->payload.room_joined.room_id);
             cJSON_AddStringToObject(json, "role", msg->payload.room_joined.role);
-            cJSON_AddNumberToObject(json, "max_receivers", msg->payload.room_joined.max_receivers);
-            cJSON_AddNumberToObject(json, "current_receivers", msg->payload.room_joined.current_receivers);
+            if (msg->payload.room_joined.local_id)
+                cJSON_AddStringToObject(json, "local_id", msg->payload.room_joined.local_id);
+            break;
+            
+        case P2P_MSG_CONNECT_REQUEST:
+            cJSON_AddStringToObject(json, "target_id", msg->payload.connect_request.target_id);
             break;
             
         case P2P_MSG_OFFER:
@@ -132,8 +137,7 @@ int p2p_handle_signal_message(P2PContext* ctx, const char* message, int size) {
             {
                 cJSON* room_id_json = cJSON_GetObjectItem(json, "room_id");
                 cJSON* role_json = cJSON_GetObjectItem(json, "role");
-                cJSON* max_receivers_json = cJSON_GetObjectItem(json, "max_receivers");
-                cJSON* current_receivers_json = cJSON_GetObjectItem(json, "current_receivers");
+                cJSON* local_id_json = cJSON_GetObjectItem(json, "local_id");
                 
                 if (cJSON_IsString(room_id_json)) {
                     msg->payload.room_joined.room_id = strdup(room_id_json->valuestring);
@@ -141,11 +145,17 @@ int p2p_handle_signal_message(P2PContext* ctx, const char* message, int size) {
                 if (cJSON_IsString(role_json)) {
                     msg->payload.room_joined.role = strdup(role_json->valuestring);
                 }
-                if (cJSON_IsNumber(max_receivers_json)) {
-                    msg->payload.room_joined.max_receivers = max_receivers_json->valueint;
+                if (cJSON_IsString(local_id_json)) {
+                    msg->payload.room_joined.local_id = strdup(local_id_json->valuestring);
                 }
-                if (cJSON_IsNumber(current_receivers_json)) {
-                    msg->payload.room_joined.current_receivers = current_receivers_json->valueint;
+            }
+            break;
+            
+        case P2P_MSG_CONNECT_REQUEST:
+            {
+                cJSON* target_id_json = cJSON_GetObjectItem(json, "target_id");
+                if (cJSON_IsString(target_id_json)) {
+                    msg->payload.connect_request.target_id = strdup(target_id_json->valuestring);
                 }
             }
             break;
@@ -301,6 +311,14 @@ void p2p_free_signal_message(P2PSignalMessage* msg) {
             if (msg->payload.room_joined.role) {
                 free(msg->payload.room_joined.role);
             }
+            if (msg->payload.room_joined.local_id) {
+                free(msg->payload.room_joined.local_id);
+            }
+            break;
+        case P2P_MSG_CONNECT_REQUEST:
+            if (msg->payload.connect_request.target_id) {
+                free(msg->payload.connect_request.target_id);
+            }
             break;
         case P2P_MSG_STREAM_REQUEST:
             if (msg->payload.stream_request.stream_id) {
@@ -346,6 +364,7 @@ const char* p2p_message_type_to_string(P2PMessageType type) {
         case P2P_MSG_LEAVE_ROOM:     return "leave_room";
         case P2P_MSG_ROOM_JOINED:    return "room_joined";
         case P2P_MSG_ROOM_LEFT:      return "room_left";
+        case P2P_MSG_CONNECT_REQUEST: return "connect_request";
         case P2P_MSG_OFFER:          return "offer";
         case P2P_MSG_ANSWER:         return "answer";
         case P2P_MSG_CANDIDATE:      return "candidate";
@@ -365,6 +384,7 @@ P2PMessageType p2p_string_to_message_type(const char* type_str) {
     if (strcmp(type_str, "leave_room") == 0)     return P2P_MSG_LEAVE_ROOM;
     if (strcmp(type_str, "room_joined") == 0)    return P2P_MSG_ROOM_JOINED;
     if (strcmp(type_str, "room_left") == 0)      return P2P_MSG_ROOM_LEFT;
+    if (strcmp(type_str, "connect_request") == 0) return P2P_MSG_CONNECT_REQUEST;
     if (strcmp(type_str, "offer") == 0)          return P2P_MSG_OFFER;
     if (strcmp(type_str, "answer") == 0)         return P2P_MSG_ANSWER;
     if (strcmp(type_str, "candidate") == 0)      return P2P_MSG_CANDIDATE;
@@ -384,15 +404,15 @@ int p2p_set_signal_message_handler(P2PContext* ctx,
                                    void* user_data) {
     if (!ctx) return AVERROR(EINVAL);
     
-    if (!ctx->callbacks) {
-        ctx->callbacks = av_mallocz(sizeof(P2PSignalCallbacks));
-        if (!ctx->callbacks) {
+    if (!ctx->signal_callbacks) {
+        ctx->signal_callbacks = av_mallocz(sizeof(P2PSignalCallbacks));
+        if (!ctx->signal_callbacks) {
             return AVERROR(ENOMEM);
         }
     }
     
-    ctx->callbacks->message_handler = handler;
-    ctx->callbacks->user_data = user_data;
+    ctx->signal_callbacks->message_handler = handler;
+    ctx->signal_callbacks->user_data = user_data;
     
     return 0;
 }

@@ -24,7 +24,10 @@
 #include "avformat.h"
 #include "internal.h"
 #include "mux.h"
+#include "rtpenc.h"
+#include "rtpenc_chain.h"
 #include "rtsp.h"
+#include "version.h"
 #include "webrtc.h"
 #include "cjson/cJSON.h"
 
@@ -66,16 +69,17 @@ typedef struct P2PRtpMuxContext {
     // 房间信息
     // RoomInfo room_info;
     
-    
-    // 流信息（延迟初始化）
-    int streams_count;
-    AVStream** streams_cache;
-    int tracks_created;
-    
+
     // 配置参数
     char* room_id;              // 可配置的房间ID
     int wait_timeout;           // 等待超时时间（秒）
 } P2PRtpMuxContext;
+
+// ==================== 前向声明 ====================
+static void set_sender_state(P2PRtpMuxContext* ctx, SenderState new_state);
+static SenderState get_state_thread_safe(P2PRtpMuxContext* ctx);
+static int p2p_rtp_mux_signal_handler(P2PContext* ctx, const P2PSignalMessage* msg);
+static int p2p_join_room_as_sender(P2PContext* p2p_ctx, const char* room_id);
 
 
 // ==================== 主要接口函数 ====================
@@ -112,13 +116,6 @@ static int p2p_rtp_muxer_init(AVFormatContext* avctx) {
     // ctx->room_info.max_receivers = 10;
     // ctx->room_info.current_receivers = 0;
     
-    // 缓存流信息，但不立即创建Track
-    // ctx->streams_count = avctx->nb_streams;
-    // ctx->streams_cache = av_mallocz(sizeof(AVStream*) * ctx->streams_count);
-    // for (int i = 0; i < ctx->streams_count; ++i) {
-    //     ctx->streams_cache[i] = avctx->streams[i];
-    // }
-    // ctx->tracks_created = 0;
     
     av_log(avctx, AV_LOG_INFO, "P2P Sender initialized with ID: %s\n", p2p_ctx->local_id);
     
@@ -143,16 +140,14 @@ static int p2p_rtp_muxer_init(AVFormatContext* avctx) {
     
     // 3. 设置状态为等待拉流端，开始阻塞等待
     set_sender_state(ctx, SENDER_STATE_WAITING_FOR_RECEIVER);
-    av_log(avctx, AV_LOG_INFO, "Waiting for receivers to join room %s...\n", ctx->room_info.room_id);
+    av_log(avctx, AV_LOG_INFO, "Waiting for receivers to join room %s...\n", ctx->room_id ? ctx->room_id : "default_room");
     
     // 4. 使用条件变量等待拉流端连接并选择本节点
     int timeout_sec = ctx->wait_timeout ? ctx->wait_timeout : 30; // 默认30秒超时
     struct timespec timeout_ts;
     clock_gettime(CLOCK_REALTIME, &timeout_ts);
     timeout_ts.tv_sec += timeout_sec;
-    
-    pthread_mutex_lock(&ctx->state_mutex);
-    
+
     while (get_state_thread_safe(ctx) != SENDER_STATE_STREAMING) {
         // 使用条件变量等待状态变化，支持超时
         int cond_ret = pthread_cond_timedwait(&ctx->state_cond, &ctx->state_mutex, &timeout_ts);
@@ -247,14 +242,11 @@ static void p2p_rtp_muxer_deinit(AVFormatContext* avctx) {
     pthread_cond_destroy(&ctx->state_cond);
     pthread_mutex_destroy(&ctx->state_mutex);
     
-    if (ctx->room_info.room_id) {
-        av_freep(&ctx->room_info.room_id);
+    if (ctx->p2p_context.room_info.room_id) {
+        av_freep(&ctx->p2p_context.room_info.room_id);
     }
-    if (ctx->room_info.room_name) {
-        av_freep(&ctx->room_info.room_name);
-    }
-    if (ctx->streams_cache) {
-        av_freep(&ctx->streams_cache);
+    if (ctx->p2p_context.room_info.room_name) {
+        av_freep(&ctx->p2p_context.room_info.room_name);
     }
     
     // 关闭P2P连接
@@ -319,7 +311,152 @@ static int p2p_rtp_mux_signal_handler(P2PContext* ctx, const P2PSignalMessage* m
             {
                 av_log(ctx->avctx, AV_LOG_INFO, "Successfully joined room: %s\n", 
                     msg->payload.room_joined.room_id);
+                
+                if (msg->payload.room_joined.room_id) {
+                    if (ctx->room_info.room_id) {
+                        av_freep(&ctx->room_info.room_id);
+                    }
+                    ctx->room_info.room_id = strdup(msg->payload.room_joined.room_id);
+                }
+                
+                if (msg->payload.room_joined.local_id) {
+                    av_log(ctx->avctx, AV_LOG_INFO, "Server assigned local_id: %s\n", 
+                           msg->payload.room_joined.local_id);
+                    
+                    if (ctx->local_id) {
+                        av_freep(&ctx->local_id);
+                    }
+                    ctx->local_id = strdup(msg->payload.room_joined.local_id);
+                }
+                
+                av_log(ctx->avctx, AV_LOG_INFO, "Room joined successfully, role: %s\n",
+                       msg->payload.room_joined.role ? msg->payload.room_joined.role : "unknown");
+                
                 set_sender_state(mux_ctx, SENDER_STATE_WAITING_FOR_RECEIVER);
+            }
+            break;
+            
+        case P2P_MSG_CONNECT_REQUEST:
+            // 收到连接请求，主动发起连接
+            {
+                const char* target_id = msg->payload.connect_request.target_id;
+                av_log(ctx->avctx, AV_LOG_INFO, "Received connect request to %s\n", target_id);
+
+                // 创建PeerConnection并发送Offer
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, target_id);
+                if (node == NULL) {
+                    int ret = init_peer_connection(ctx, target_id);
+                    if (ret < 0) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to create peer connection for %s\n", target_id);
+                        return ret;
+                    }
+
+                    node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, target_id);
+                }
+
+                // 如果node还没有创建tracks，先创建它们（包括完整的RTP context初始化）
+                //xy: 一次性完成所有track的创建和初始化，避免多次往返，提升效率
+                if (!node->probe_track) {
+                    AVFormatContext* avctx = ctx->avctx;
+                    
+                    // 1. 创建并完全初始化probe track（探测轨道）
+                    PeerConnectionTrack* probe_track = av_mallocz(sizeof(PeerConnectionTrack));
+                    if (!probe_track) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate probe track\n");
+                        return AVERROR(ENOMEM);
+                    }
+                    
+                    int ret = init_probe_track_ex(ctx->avctx, node, probe_track);
+                    if (ret < 0) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to initialize probe track for %s\n", target_id);
+                        av_freep(&probe_track);
+                        return ret;
+                    }
+                    
+                    node->probe_track = probe_track;
+                    av_log(ctx->avctx, AV_LOG_INFO, "Created and initialized probe track for %s\n", target_id);
+                    
+                    // 2. 为每个媒体流创建并完全初始化Track（包括RTP上下文）
+                    for (int i = 0; i < avctx->nb_streams; ++i) {
+                        AVStream* stream = avctx->streams[i];
+                        const AVCodecParameters* codecpar = stream->codecpar;
+                        
+                        if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && !node->video_track) {
+                            // 创建并初始化视频轨道
+                            PeerConnectionTrack* video_track = av_mallocz(sizeof(PeerConnectionTrack));
+                            if (!video_track) {
+                                av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate video track\n");
+                                return AVERROR(ENOMEM);
+                            }
+                            
+                            video_track->stream_index = i;
+                            video_track->track_type = PeerConnectionTrackType_Video;
+                            
+                            // 立即初始化RTP上下文，避免延迟
+                            ret = init_send_track_ex(avctx, stream, node, video_track, i);
+                            if (ret < 0) {
+                                av_log(ctx->avctx, AV_LOG_ERROR, "Failed to initialize video track for stream %d, target %s\n", i, target_id);
+                                av_freep(&video_track);
+                                return ret;
+                            }
+                            
+                            node->video_track = video_track;
+                            av_log(ctx->avctx, AV_LOG_INFO, "Created and initialized video track for stream %d, target %s\n", i, target_id);
+                            
+                        } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO && !node->audio_track) {
+                            // 创建并初始化音频轨道
+                            PeerConnectionTrack* audio_track = av_mallocz(sizeof(PeerConnectionTrack));
+                            if (!audio_track) {
+                                av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate audio track\n");
+                                return AVERROR(ENOMEM);
+                            }
+                            
+                            audio_track->stream_index = i;
+                            audio_track->track_type = PeerConnectionTrackType_Audio;
+                            
+                            // 立即初始化RTP上下文，避免延迟
+                            ret = init_send_track_ex(avctx, stream, node, audio_track, i);
+                            if (ret < 0) {
+                                av_log(ctx->avctx, AV_LOG_ERROR, "Failed to initialize audio track for stream %d, target %s\n", i, target_id);
+                                av_freep(&audio_track);
+                                return ret;
+                            }
+                            
+                            node->audio_track = audio_track;
+                            av_log(ctx->avctx, AV_LOG_INFO, "Created and initialized audio track for stream %d, target %s\n", i, target_id);
+                        }
+                    }
+                    
+                    av_log(ctx->avctx, AV_LOG_INFO, "All tracks created and initialized for %s\n", target_id);
+                }
+                
+                if (!node->probe_track || !node->probe_track->track_id) {
+                    av_log(ctx->avctx, AV_LOG_ERROR, "Probe track not found for %s\n", target_id);
+                    return AVERROR(EINVAL);
+                }
+
+                // 获取SDP
+                int sdp_size = 4096; // 预设一个足够大的缓冲区大小
+                char* sdp = av_malloc(sdp_size);
+                if (sdp) {
+                    int ret = rtcGetTrackDescription(node->probe_track->track_id, sdp, sdp_size);
+                    if (ret < 0) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "rtcGetTrackDescription失败，track_id: %d\n", node->probe_track->track_id);
+                        av_free(sdp);
+                        sdp = NULL;
+                    }
+                } else {
+                    av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate memory for SDP\n");
+                    return AVERROR(ENOMEM);
+                }
+
+                // 发送信令服务器
+                P2PSignalMessage* msg = p2p_create_signal_message(P2P_MSG_OFFER, target_id); 
+                msg->payload.offer.description = sdp;
+                p2p_send_signal_message(ctx, msg);
+                p2p_free_signal_message(msg);
+
+                set_sender_state(mux_ctx, SENDER_STATE_SIGNALING);
             }
             break;
             
@@ -399,14 +536,13 @@ static int p2p_rtp_mux_signal_handler(P2PContext* ctx, const P2PSignalMessage* m
                         return AVERROR(EINVAL);
                     }
                     
-                    set_sender_state(mux_ctx, SENDER_STATE_CREATING_TRACKS);
-                    
-                    // 创建媒体轨道
-                    int ret = create_media_tracks_for_receiver(mux_ctx, node);
-                    if (ret < 0) {
-                        set_sender_state(mux_ctx, SENDER_STATE_ERROR);
-                        return ret;
+                    // 检查tracks是否已经准备好（应该在CONNECT_REQUEST阶段已经创建）
+                    if (!node->probe_track || !node->video_track || !node->audio_track) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Tracks not ready for receiver %s\n", msg->id);
+                        return AVERROR(EINVAL);
                     }
+                    
+                    av_log(ctx->avctx, AV_LOG_INFO, "All tracks already initialized, ready for streaming to %s\n", msg->id);
                     
                     // 发送推流就绪消息
                     P2PSignalMessage* ready_msg = p2p_create_signal_message(P2P_MSG_STREAM_READY, ctx->local_id);
@@ -419,6 +555,8 @@ static int p2p_rtp_mux_signal_handler(P2PContext* ctx, const P2PSignalMessage* m
                     set_sender_state(mux_ctx, SENDER_STATE_STREAMING);
                     ctx->selected_node = node;
                     node->status = Selected;
+                    
+                    av_log(ctx->avctx, AV_LOG_INFO, "Stream request processed, now streaming to %s\n", msg->id);
                 }
             }
             break;
@@ -455,68 +593,6 @@ static int p2p_join_room_as_sender(P2PContext* p2p_ctx, const char* room_id) {
     return ret;
 }
 
-// ==================== 媒体轨道创建（延迟创建）====================
-
-static int create_media_tracks_for_receiver(P2PRtpMuxContext* ctx, PeerConnectionNode* node) {
-    AVFormatContext* avctx = ctx->p2p_context.avctx;
-    const AVChannelLayout supported_layout = AV_CHANNEL_LAYOUT_STEREO;
-    
-    av_log(avctx, AV_LOG_INFO, "Creating media tracks for receiver %s\n", node->remote_id);
-    
-    // 为每个媒体流创建Track
-    for (int i = 0; i < avctx->nb_streams; ++i) {
-        AVStream* stream = avctx->streams[i];
-        const AVCodecParameters* codecpar = stream->codecpar;
-        
-        PeerConnectionTrack* track = av_mallocz(sizeof(PeerConnectionTrack));
-        if (track == NULL) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to allocate track\n");
-            return AVERROR(ENOMEM);
-        }
-        
-        track->stream_index = i;
-        
-        switch (codecpar->codec_type) {
-            case AVMEDIA_TYPE_VIDEO:
-                avpriv_set_pts_info(stream, 32, 1, 90000);
-                track->track_type = PeerConnectionTrackType_Video;
-                node->video_track = track;
-                break;
-            case AVMEDIA_TYPE_AUDIO:
-                if (codecpar->sample_rate != 48000) {
-                    av_log(avctx, AV_LOG_ERROR, "Unsupported sample rate. Only 48kHz is supported\n");
-                    av_freep(&track);
-                    return AVERROR(EINVAL);
-                }
-                if (av_channel_layout_compare(&codecpar->ch_layout, &supported_layout) != 0) {
-                    av_log(avctx, AV_LOG_ERROR, "Unsupported channel layout. Only stereo is supported\n");
-                    av_freep(&track);
-                    return AVERROR(EINVAL);
-                }
-                avpriv_set_pts_info(stream, 32, 1, codecpar->sample_rate);
-                track->track_type = PeerConnectionTrackType_Audio;
-                node->audio_track = track;
-                break;
-            default:
-                av_freep(&track);
-                continue;
-        }
-        
-        // 调用外部函数创建实际的Track
-        int ret = init_send_track_ex(avctx, stream, node, track, i);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to initialize track for stream %d\n", i);
-            av_freep(&track);
-            return ret;
-        }
-        
-        // 添加到轨道缓存
-        append_peer_connection_track_to_list(&node->track_caches, track);
-    }
-    
-    ctx->tracks_created = 1;
-    return 0;
-}
 
 // ==================== 配置选项 ====================
 

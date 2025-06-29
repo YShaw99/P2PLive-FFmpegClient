@@ -54,6 +54,15 @@ typedef struct P2PRtpDemuxContext {
     AVStream *streams[2];       // 假设音视频各一个流
 } P2PRtpDemuxContext;
 
+// ==================== 前向声明 ====================
+static void set_receiver_state(P2PRtpDemuxContext* ctx, ReceiverState new_state);
+static int p2p_rtp_demux_signal_handler(P2PContext* ctx, const P2PSignalMessage* msg);
+static int p2p_join_room_as_receiver(P2PContext* p2p_ctx, const char* room_id);
+static int handle_datachannel_ready(P2PRtpDemuxContext* ctx, PeerConnectionNode* node);
+static void on_datachannel_established(P2PRtpDemuxContext* ctx, PeerConnectionNode* node);
+static int check_state_timeout(P2PRtpDemuxContext* ctx, int64_t timeout_us);
+static int pending_for_probing_node(P2PRtpDemuxContext* ctx);
+
 // ==================== 主要初始化函数 ====================
 static int p2p_rtp_demux_init(AVFormatContext *avctx) {
     P2PRtpDemuxContext *ctx = avctx->priv_data;
@@ -65,8 +74,9 @@ static int p2p_rtp_demux_init(AVFormatContext *avctx) {
     set_receiver_state(ctx, RECEIVER_STATE_IDLE);
     
     // 生成本地ID
+    //xy:todo:删掉
     char local_id[64];
-    snprintf(local_id, sizeof(local_id), "receiver_1");//%08x", av_get_random_seed());
+    snprintf(local_id, sizeof(local_id), "recv");//%08x", av_get_random_seed());
     p2p_ctx->local_id = strdup(local_id);
     
     av_log(avctx, AV_LOG_INFO, "P2P Receiver initialized with ID: %s\n", p2p_ctx->local_id);
@@ -93,6 +103,380 @@ static int p2p_rtp_demux_init(AVFormatContext *avctx) {
         return ret;
     }
 
+    return 0;
+}
+
+static int p2p_rtp_read_header(AVFormatContext *avctx) {
+    P2PRtpDemuxContext *ctx = avctx->priv_data;
+    P2PContext *p2p_ctx = &ctx->p2p_context;
+    char media_stream_id[37];
+    PeerConnectionNode *pc_node = NULL;
+    int ret;
+
+    av_log(avctx, AV_LOG_INFO, "Starting P2P RTP demux initialization\n");
+
+    // 初始化P2P连接
+    if ((ret = p2p_rtp_demux_init(avctx)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to p2p_rtp_demux_init\n");
+        goto fail;
+    }
+
+    // 等待推流状态就绪
+    if ((ret = pending_for_probing_node(ctx)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to reach streaming state\n");
+        goto fail;
+    }
+
+    pc_node = p2p_ctx->selected_node;
+    if (!pc_node) {
+        av_log(avctx, AV_LOG_ERROR, "No selected node available\n");
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+    
+    pc_node->p2p_ctx = p2p_ctx;
+
+    // 生成媒体流ID
+    if ((ret = p2p_generate_media_stream_id(media_stream_id)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to generate media stream id\n");
+        goto fail;
+    }
+
+    // 媒体tracks现在在SDP协商阶段预创建，在track回调中完成初始化
+
+    av_log(avctx, AV_LOG_INFO, "P2P RTP demux ready to receive stream from %s\n", pc_node->remote_id);
+    return 0;
+
+fail:
+    return ret;
+}
+
+static int p2p_rtp_read_packet(AVFormatContext *avctx, AVPacket *pkt) {
+    P2PRtpDemuxContext *ctx = avctx->priv_data;
+    PeerConnectionNode *node = ctx->p2p_context.selected_node;
+    
+    if (!node) {
+        av_log(avctx, AV_LOG_ERROR, "No selected node for reading packet\n");
+        return AVERROR(EINVAL);
+    }
+    
+    if (ctx->current_state != RECEIVER_STATE_STREAMING) {
+        av_log(avctx, AV_LOG_ERROR, "Not in streaming state\n");
+        return AVERROR(EINVAL);
+    }
+    
+    PeerConnectionTrack* track = find_peer_connection_track_by_stream_index(node->track_caches, 0);
+    if (!track || !track->rtp_ctx) {
+        av_log(avctx, AV_LOG_ERROR, "No valid track found for stream index 0\n");
+        return AVERROR(EINVAL);
+    }
+
+    pkt->stream_index = 0;  // 确保stream_index正确
+    int ret = av_read_frame(track->rtp_ctx, pkt);
+    
+    return ret;
+}
+
+static int p2p_rtp_close(AVFormatContext *avctx) {
+    P2PRtpDemuxContext *ctx = avctx->priv_data;
+    
+    av_log(avctx, AV_LOG_INFO, "Closing P2P RTP demux\n");
+    
+    // 清理资源
+    p2p_close_resource(&ctx->p2p_context);
+    
+    if (ctx->room_id) {
+        av_freep(&ctx->room_id);
+    }
+    
+    return 0;
+}
+
+// ==================== 状态管理函数 ====================
+
+static void set_receiver_state(P2PRtpDemuxContext* ctx, ReceiverState new_state) {
+    if (ctx->current_state != new_state) {
+        av_log(ctx->p2p_context.avctx, AV_LOG_INFO, 
+               "Receiver state change: %d -> %d\n", ctx->current_state, new_state);
+        ctx->current_state = new_state;
+        ctx->state_enter_time = av_gettime_relative();
+    }
+}
+
+static int check_state_timeout(P2PRtpDemuxContext* ctx, int64_t timeout_us) {
+    return (av_gettime_relative() - ctx->state_enter_time) > timeout_us;
+}
+
+// ==================== 信令消息处理回调 ====================
+
+static int p2p_rtp_demux_signal_handler(P2PContext* ctx, const P2PSignalMessage* msg) {
+    P2PRtpDemuxContext* demux_ctx = (P2PRtpDemuxContext*)ctx->avctx->priv_data;
+    
+    av_log(ctx->avctx, AV_LOG_DEBUG, "Demux processing signal message type: %d from: %s\n", 
+           msg->type, msg->id ? msg->id : "unknown");
+    
+    switch (msg->type) {
+        case P2P_MSG_ROOM_JOINED:
+            // 房间加入成功
+            {
+                av_log(ctx->avctx, AV_LOG_INFO, "Successfully joined room: %s\n", 
+                       msg->payload.room_joined.room_id);
+                
+                if (msg->payload.room_joined.room_id) {
+                    if (ctx->room_info.room_id) {
+                        av_freep(&ctx->room_info.room_id);
+                    }
+                    ctx->room_info.room_id = strdup(msg->payload.room_joined.room_id);
+                }
+                
+                if (msg->payload.room_joined.local_id) {
+                    av_log(ctx->avctx, AV_LOG_INFO, "Server assigned local_id: %s\n", 
+                           msg->payload.room_joined.local_id);
+                    if (ctx->local_id) {
+                        av_freep(&ctx->local_id);
+                    }
+                    ctx->local_id = strdup(msg->payload.room_joined.local_id);
+                }
+                
+                av_log(ctx->avctx, AV_LOG_INFO, "Room joined successfully, role: %s\n",
+                       msg->payload.room_joined.role ? msg->payload.room_joined.role : "unknown");
+                
+                set_receiver_state(demux_ctx, RECEIVER_STATE_WAITING_FOR_SENDER);
+            }
+            break;
+            
+        case P2P_MSG_CONNECT_REQUEST:
+            // 收到连接请求，主动发起连接
+            {
+                const char* target_id = msg->payload.connect_request.target_id;
+                av_log(ctx->avctx, AV_LOG_INFO, "Received connect request to %s\n", target_id);
+
+                // 创建PeerConnection并发送Offer
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, target_id);
+                if (node == NULL) {
+                    int ret = init_peer_connection(ctx, target_id);
+                    if (ret < 0) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to create peer connection for %s\n", target_id);
+                        return ret;
+                    }
+
+                    node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, target_id);
+                }
+                    //xy:TODO 待调试
+
+                // 如果node还没有创建tracks，先创建它们（接收端预创建） 接收端可以预先创建probe track，媒体tracks等待SDP协商后创建
+                if (!node->probe_track) {
+                    // 1. 创建并完全初始化probe track（探测轨道）
+                    PeerConnectionTrack* probe_track = av_mallocz(sizeof(PeerConnectionTrack));
+                    if (!probe_track) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate probe track\n");
+                        return AVERROR(ENOMEM);
+                    }
+                    
+                    int ret = init_probe_track_ex(ctx->avctx, node, probe_track);
+                    if (ret < 0) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to initialize probe track for %s\n", target_id);
+                        av_freep(&probe_track);
+                        return ret;
+                    }
+                    
+                    node->probe_track = probe_track;
+                    av_log(ctx->avctx, AV_LOG_INFO, "Created and initialized probe track for receiver %s\n", target_id);
+                    
+                    // 注意：接收端的媒体tracks需要等待SDP协商完成后才能创建
+                    // 因为需要从SDP中获取codec、payload type、SSRC等参数
+                    av_log(ctx->avctx, AV_LOG_INFO, "Media tracks will be created after SDP negotiation for %s\n", target_id);
+                }
+                
+                if (!node->probe_track || !node->probe_track->track_id) {
+                    av_log(ctx->avctx, AV_LOG_ERROR, "Probe track not found for %s\n", target_id);
+                    return AVERROR(EINVAL);
+                }
+
+                // 获取SDP
+                int sdp_size = 4096; // 预设一个足够大的缓冲区大小
+                char* sdp = av_malloc(sdp_size);
+                if (sdp) {
+                    int ret = rtcGetTrackDescription(node->probe_track->track_id, sdp, sdp_size);
+                    if (ret < 0) {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "rtcGetTrackDescription失败，track_id: %d\n", node->probe_track->track_id);
+                        av_free(sdp);
+                        sdp = NULL;
+                    }
+                } else {
+                    av_log(ctx->avctx, AV_LOG_ERROR, "Failed to allocate memory for SDP\n");
+                    return AVERROR(ENOMEM);
+                }
+
+                // 发送信令服务器
+                P2PSignalMessage* msg = p2p_create_signal_message(P2P_MSG_OFFER, target_id); 
+                msg->payload.offer.description = sdp;
+                p2p_send_signal_message(ctx, msg);
+                p2p_free_signal_message(msg);
+
+                set_receiver_state(demux_ctx, RECEIVER_STATE_SIGNALING);
+            }
+            break;
+            
+        case P2P_MSG_OFFER:
+            // 收到推流端的Offer
+            {
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
+                if (node == NULL) {
+                    // 新建 PeerConnection
+                    int ret = init_peer_connection(ctx, msg->id);
+                    if (ret == 0) {
+                        node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
+                        av_log(ctx->avctx, AV_LOG_INFO, "Created new peer connection for sender %s\n", msg->id);
+                    } else {
+                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to create peer connection for %s\n", msg->id);
+                        return ret;
+                    }
+                }
+                
+                if (node && msg->payload.offer.description) {
+                    rtcSetRemoteDescription(node->pc_id, msg->payload.offer.description, "offer");
+                    
+                    //xy:TODO 待调试
+                    // // 收到Offer SDP后，预创建接收用的媒体tracks
+                    // // 注意：这里我们创建标准的视频和音频tracks，具体参数将在track回调中确定
+                    // if (!node->video_track && !node->audio_track) {
+                    //     av_log(ctx->avctx, AV_LOG_INFO, "Creating receiving tracks for sender %s after SDP negotiation\n", msg->id);
+                        
+                    //     // 创建视频接收track占位符（具体参数待track回调确定）
+                    //     PeerConnectionTrack* video_track = av_mallocz(sizeof(PeerConnectionTrack));
+                    //     if (video_track) {
+                    //         video_track->track_type = PeerConnectionTrackType_Video;
+                    //         video_track->stream_index = 0;
+                    //         node->video_track = video_track;
+                    //         av_log(ctx->avctx, AV_LOG_INFO, "Created video track placeholder for %s\n", msg->id);
+                    //     }
+                        
+                    //     // 创建音频接收track占位符（具体参数待track回调确定）
+                    //     PeerConnectionTrack* audio_track = av_mallocz(sizeof(PeerConnectionTrack));
+                    //     if (audio_track) {
+                    //         audio_track->track_type = PeerConnectionTrackType_Audio;
+                    //         audio_track->stream_index = 1;
+                    //         node->audio_track = audio_track;
+                    //         av_log(ctx->avctx, AV_LOG_INFO, "Created audio track placeholder for %s\n", msg->id);
+                    //     }
+                        
+                    //     av_log(ctx->avctx, AV_LOG_INFO, "Media track placeholders created for %s (will be fully initialized in track callback)\n", msg->id);
+                    // }
+                    
+                    set_receiver_state(demux_ctx, RECEIVER_STATE_SIGNALING);
+                }
+            }
+            break;
+            
+        case P2P_MSG_ANSWER:
+            // 处理Answer
+            {
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
+                if (node && msg->payload.answer.description) {
+                    rtcSetRemoteDescription(node->pc_id, msg->payload.answer.description, "answer");
+                } else {
+                    av_log(ctx->avctx, AV_LOG_ERROR, "Failed to find peer connection node for %s\n", msg->id);
+                    return AVERROR(EINVAL);
+                }
+            }
+            break;
+            
+        case P2P_MSG_CANDIDATE:
+            // 处理ICE候选
+            {
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
+                if (node && msg->payload.candidate.candidate && msg->payload.candidate.mid) {
+                    rtcAddRemoteCandidate(node->pc_id, msg->payload.candidate.candidate, msg->payload.candidate.mid);
+                }
+            }
+            break;
+            
+        case P2P_MSG_PROBE_RESPONSE:
+            // 处理探测响应
+            {
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
+                if (node) {
+                    av_log(ctx->avctx, AV_LOG_INFO, "Received probe response from %s, probe_id=%s, status=%s\n", 
+                           msg->id, msg->payload.probe_response.probe_id, msg->payload.probe_response.status);
+                    
+                    if (strcmp(msg->payload.probe_response.status, "ok") == 0) {
+                        //Todo:xy: 这里应该计算该node的网络情况，例如停止计时，计算rtt
+                        // 探测成功，标记探测阶段完成
+                        node->network_quality.phase = PROBING_COMPLETE;
+                        
+                        //Todo:xy: 这里应该有一个通知，所有节点都收到通知或者超时后，再转变为RECEIVER_STATE_PROBE_COMPLETED状态，计算最优节点。
+                        // av_log(ctx->avctx, AV_LOG_INFO, "Network probing completed, selecting best node\n");
+                        
+                        // PeerConnectionNode* best_node = select_best_node(ctx);
+                        // if (!best_node) {
+                        //     av_log(ctx->avctx, AV_LOG_ERROR, "Failed to select best node\n");
+                        //     set_receiver_state(demux_ctx, RECEIVER_STATE_ERROR);
+                        //     return AVERROR(EINVAL);
+                        // }
+                        
+                        // av_log(ctx->avctx, AV_LOG_INFO, "Selected best node %s with score %.2f\n", 
+                        //        best_node->remote_id, best_node->network_quality.final_score);
+                        
+                        // 设置选中的节点
+                        // ctx->selected_node = best_node;
+                        // best_node->status = Selected;
+                        // set_receiver_state(demux_ctx, RECEIVER_STATE_PROBE_COMPLETED);
+                    }
+                }
+            }
+            break;
+            
+        case P2P_MSG_STREAM_READY:
+            // 推流端准备就绪
+            {
+                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
+                
+                if (node && node == ctx->selected_node) {
+                    av_log(ctx->avctx, AV_LOG_INFO, "Stream ready from %s, stream_id=%s\n", 
+                           msg->id, msg->payload.stream_ready.stream_id ? msg->payload.stream_ready.stream_id : "unknown");
+                    
+                    set_receiver_state(demux_ctx, RECEIVER_STATE_STREAMING);
+                    ctx->waiting_for_sender = 0;  // Todo:xy: 这个标记位后续可以删掉了，改用state管理
+                } else {
+                    av_log(ctx->avctx, AV_LOG_WARNING, "Received stream ready from non-selected node %s\n", msg->id);
+                }
+            }
+            break;
+            
+        case P2P_MSG_ERROR:
+            // 处理错误消息
+            {
+                av_log(ctx->avctx, AV_LOG_ERROR, "Received error from %s: code=%s, msg=%s\n",
+                       msg->id ? msg->id : "unknown",
+                       msg->payload.error.error_code ? msg->payload.error.error_code : "unknown",
+                       msg->payload.error.error_msg ? msg->payload.error.error_msg : "unknown");
+                set_receiver_state(demux_ctx, RECEIVER_STATE_ERROR);
+            }
+            break;
+            
+        default:
+            av_log(ctx->avctx, AV_LOG_DEBUG, "Unhandled message type: %d\n", msg->type);
+            break;
+    }
+    
+    return 0;
+}
+
+static int handle_datachannel_ready(P2PRtpDemuxContext* ctx, PeerConnectionNode* node) {
+    av_log(ctx->p2p_context.avctx, AV_LOG_INFO, "DataChannel ready for node %s\n", node->remote_id);
+    
+    // 初始化探测数据结构
+    probe_data_init(&node->network_quality);
+    
+    // 创建探测通道
+    int ret = create_probe_channel(node);
+    if (ret < 0) {
+        av_log(ctx->p2p_context.avctx, AV_LOG_ERROR, "Failed to create probe channel\n");
+        return ret;
+    }
+    
+    set_receiver_state(ctx, RECEIVER_STATE_DATACHANNEL_READY);
     return 0;
 }
 
@@ -252,311 +636,6 @@ static int pending_for_probing_node(P2PRtpDemuxContext* ctx) {
         av_usleep(100000); // 100ms
     }
     
-    return 0;
-}
-
-static int p2p_rtp_read_header(AVFormatContext *avctx) {
-    P2PRtpDemuxContext *ctx = avctx->priv_data;
-    P2PContext *p2p_ctx = &ctx->p2p_context;
-    char media_stream_id[37];
-    PeerConnectionNode *pc_node = NULL;
-    PeerConnectionTrack *video_track = NULL, *audio_track = NULL;
-    AVStream* video_stream = NULL, *audio_stream = NULL;
-    int ret;
-
-    av_log(avctx, AV_LOG_INFO, "Starting P2P RTP demux initialization\n");
-
-    // 初始化P2P连接
-    if ((ret = p2p_rtp_demux_init(avctx)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to p2p_rtp_demux_init\n");
-        goto fail;
-    }
-
-    // 等待推流状态就绪
-    if ((ret = pending_for_probing_node(ctx)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to reach streaming state\n");
-        goto fail;
-    }
-
-    pc_node = p2p_ctx->selected_node;
-    if (!pc_node) {
-        av_log(avctx, AV_LOG_ERROR, "No selected node available\n");
-        ret = AVERROR(EINVAL);
-        goto fail;
-    }
-    
-    pc_node->p2p_ctx = p2p_ctx;
-
-    // 生成媒体流ID
-    if ((ret = p2p_generate_media_stream_id(media_stream_id)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to generate media stream id\n");
-        goto fail;
-    }
-
-    /*
-    // 初始化视频轨道
-    if (pc_node->video_track) {
-        video_track = pc_node->video_track;
-        video_track->stream_index = 0;
-        video_stream = avformat_new_stream(avctx, NULL);
-        if (!video_stream) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
-        }
-        video_stream->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        video_stream->codecpar->codec_id = AV_CODEC_ID_H264;
-        
-        ret = init_recv_track_ex(avctx, video_stream, pc_node, video_track, 96, 9926, 0);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to initialize video track\n");
-            goto fail;
-        }
-        av_log(avctx, AV_LOG_INFO, "Video track initialized successfully\n");
-    }
-
-    // 初始化音频轨道（如果需要）
-    if (pc_node->audio_track) {
-        audio_track = pc_node->audio_track;
-        audio_track->stream_index = 1;
-        audio_stream = avformat_new_stream(avctx, NULL);
-        if (!audio_stream) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
-        }
-        audio_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-        audio_stream->codecpar->codec_id = AV_CODEC_ID_OPUS;
-        
-        ret = init_recv_track_ex(avctx, audio_stream, pc_node, audio_track, 97, av_get_random_seed(), 1);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to initialize audio track\n");
-            goto fail;
-        }
-        av_log(avctx, AV_LOG_INFO, "Audio track initialized successfully\n");
-    }
-    */
-
-    av_log(avctx, AV_LOG_INFO, "P2P RTP demux ready to receive stream from %s\n", pc_node->remote_id);
-    return 0;
-
-fail:
-    if (video_track && video_track->track_id > 0) {
-        rtcDeleteTrack(video_track->track_id);
-    }
-    if (audio_track && audio_track->track_id > 0) {
-        rtcDeleteTrack(audio_track->track_id);
-    }
-    return ret;
-}
-
-static int p2p_rtp_read_packet(AVFormatContext *avctx, AVPacket *pkt) {
-    P2PRtpDemuxContext *ctx = avctx->priv_data;
-    PeerConnectionNode *node = ctx->p2p_context.selected_node;
-    
-    if (!node) {
-        av_log(avctx, AV_LOG_ERROR, "No selected node for reading packet\n");
-        return AVERROR(EINVAL);
-    }
-    
-    if (ctx->current_state != RECEIVER_STATE_STREAMING) {
-        av_log(avctx, AV_LOG_ERROR, "Not in streaming state\n");
-        return AVERROR(EINVAL);
-    }
-    
-    PeerConnectionTrack* track = find_peer_connection_track_by_stream_index(node->track_caches, 0);
-    if (!track || !track->rtp_ctx) {
-        av_log(avctx, AV_LOG_ERROR, "No valid track found for stream index 0\n");
-        return AVERROR(EINVAL);
-    }
-
-    pkt->stream_index = 0;  // 确保stream_index正确
-    int ret = av_read_frame(track->rtp_ctx, pkt);
-    
-    return ret;
-}
-
-static int p2p_rtp_close(AVFormatContext *avctx) {
-    P2PRtpDemuxContext *ctx = avctx->priv_data;
-    
-    av_log(avctx, AV_LOG_INFO, "Closing P2P RTP demux\n");
-    
-    // 清理资源
-    p2p_close_resource(&ctx->p2p_context);
-    
-    if (ctx->room_id) {
-        av_freep(&ctx->room_id);
-    }
-    
-    return 0;
-}
-
-// ==================== 状态管理函数 ====================
-
-static void set_receiver_state(P2PRtpDemuxContext* ctx, ReceiverState new_state) {
-    if (ctx->current_state != new_state) {
-        av_log(ctx->p2p_context.avctx, AV_LOG_INFO, 
-               "Receiver state change: %d -> %d\n", ctx->current_state, new_state);
-        ctx->current_state = new_state;
-        ctx->state_enter_time = av_gettime_relative();
-    }
-}
-
-static int check_state_timeout(P2PRtpDemuxContext* ctx, int64_t timeout_us) {
-    return (av_gettime_relative() - ctx->state_enter_time) > timeout_us;
-}
-
-
-// ==================== 信令消息处理回调 ====================
-
-static int p2p_rtp_demux_signal_handler(P2PContext* ctx, const P2PSignalMessage* msg) {
-    P2PRtpDemuxContext* demux_ctx = (P2PRtpDemuxContext*)ctx->avctx->priv_data;
-    
-    av_log(ctx->avctx, AV_LOG_DEBUG, "Demux processing signal message type: %d from: %s\n", 
-           msg->type, msg->id ? msg->id : "unknown");
-    
-    switch (msg->type) {
-        case P2P_MSG_ROOM_JOINED:
-            // 房间加入成功
-            {
-                av_log(ctx->avctx, AV_LOG_INFO, "Successfully joined room: %s\n", 
-                       msg->payload.room_joined.room_id);
-                av_log(ctx->avctx, AV_LOG_INFO, "Room info - Max receivers: %d, Current receivers: %d\n",
-                       msg->payload.room_joined.max_receivers, msg->payload.room_joined.current_receivers);
-                
-                set_receiver_state(demux_ctx, RECEIVER_STATE_WAITING_FOR_SENDER);
-            }
-            break;
-            
-        case P2P_MSG_OFFER:
-            // 收到推流端的Offer
-            {
-                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
-                if (node == NULL) {
-                    // 新建 PeerConnection
-                    int ret = init_peer_connection(ctx, msg->id);
-                    if (ret == 0) {
-                        node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
-                        av_log(ctx->avctx, AV_LOG_INFO, "Created new peer connection for sender %s\n", msg->id);
-                    } else {
-                        av_log(ctx->avctx, AV_LOG_ERROR, "Failed to create peer connection for %s\n", msg->id);
-                        return ret;
-                    }
-                }
-                
-                if (node && msg->payload.offer.description) {
-                    rtcSetRemoteDescription(node->pc_id, msg->payload.offer.description, "offer");
-                    set_receiver_state(demux_ctx, RECEIVER_STATE_SIGNALING);
-                }
-            }
-            break;
-            
-        case P2P_MSG_ANSWER:
-            // 处理Answer
-            {
-                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
-                if (node && msg->payload.answer.description) {
-                    rtcSetRemoteDescription(node->pc_id, msg->payload.answer.description, "answer");
-                } else {
-                    av_log(ctx->avctx, AV_LOG_ERROR, "Failed to find peer connection node for %s\n", msg->id);
-                    return AVERROR(EINVAL);
-                }
-            }
-            break;
-            
-        case P2P_MSG_CANDIDATE:
-            // 处理ICE候选
-            {
-                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
-                if (node && msg->payload.candidate.candidate && msg->payload.candidate.mid) {
-                    rtcAddRemoteCandidate(node->pc_id, msg->payload.candidate.candidate, msg->payload.candidate.mid);
-                }
-            }
-            break;
-            
-        case P2P_MSG_PROBE_RESPONSE:
-            // 处理探测响应
-            {
-                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
-                if (node) {
-                    av_log(ctx->avctx, AV_LOG_INFO, "Received probe response from %s, probe_id=%s, status=%s\n", 
-                           msg->id, msg->payload.probe_response.probe_id, msg->payload.probe_response.status);
-                    
-                    if (strcmp(msg->payload.probe_response.status, "ok") == 0) {
-                        //Todo:xy: 这里应该计算该node的网络情况，例如停止计时，计算rtt
-                        // 探测成功，标记探测阶段完成
-                        node->network_quality.phase = PROBING_COMPLETE;
-                        
-                        //Todo:xy: 这里应该有一个通知，所有节点都收到通知或者超时后，再转变为RECEIVER_STATE_PROBE_COMPLETED状态，计算最优节点。
-                        // av_log(ctx->avctx, AV_LOG_INFO, "Network probing completed, selecting best node\n");
-                        
-                        // PeerConnectionNode* best_node = select_best_node(ctx);
-                        // if (!best_node) {
-                        //     av_log(ctx->avctx, AV_LOG_ERROR, "Failed to select best node\n");
-                        //     set_receiver_state(demux_ctx, RECEIVER_STATE_ERROR);
-                        //     return AVERROR(EINVAL);
-                        // }
-                        
-                        // av_log(ctx->avctx, AV_LOG_INFO, "Selected best node %s with score %.2f\n", 
-                        //        best_node->remote_id, best_node->network_quality.final_score);
-                        
-                        // 设置选中的节点
-                        // ctx->selected_node = best_node;
-                        // best_node->status = Selected;
-                        // set_receiver_state(demux_ctx, RECEIVER_STATE_PROBE_COMPLETED);
-                    }
-                }
-            }
-            break;
-            
-        case P2P_MSG_STREAM_READY:
-            // 推流端准备就绪
-            {
-                PeerConnectionNode* node = find_peer_connection_node_by_remote_id(ctx->peer_connection_node_caches, msg->id);
-                
-                if (node && node == ctx->selected_node) {
-                    av_log(ctx->avctx, AV_LOG_INFO, "Stream ready from %s, stream_id=%s\n", 
-                           msg->id, msg->payload.stream_ready.stream_id ? msg->payload.stream_ready.stream_id : "unknown");
-                    
-                    set_receiver_state(demux_ctx, RECEIVER_STATE_STREAMING);
-                    ctx->waiting_for_sender = 0;  // Todo:xy: 这个标记位后续可以删掉了，改用state管理
-                } else {
-                    av_log(ctx->avctx, AV_LOG_WARNING, "Received stream ready from non-selected node %s\n", msg->id);
-                }
-            }
-            break;
-            
-        case P2P_MSG_ERROR:
-            // 处理错误消息
-            {
-                av_log(ctx->avctx, AV_LOG_ERROR, "Received error from %s: code=%s, msg=%s\n",
-                       msg->id ? msg->id : "unknown",
-                       msg->payload.error.error_code ? msg->payload.error.error_code : "unknown",
-                       msg->payload.error.error_msg ? msg->payload.error.error_msg : "unknown");
-                set_receiver_state(demux_ctx, RECEIVER_STATE_ERROR);
-            }
-            break;
-            
-        default:
-            av_log(ctx->avctx, AV_LOG_DEBUG, "Unhandled message type: %d\n", msg->type);
-            break;
-    }
-    
-    return 0;
-}
-
-static int handle_datachannel_ready(P2PRtpDemuxContext* ctx, PeerConnectionNode* node) {
-    av_log(ctx->p2p_context.avctx, AV_LOG_INFO, "DataChannel ready for node %s\n", node->remote_id);
-    
-    // 初始化探测数据结构
-    probe_data_init(&node->network_quality);
-    
-    // 创建探测通道
-    int ret = create_probe_channel(node);
-    if (ret < 0) {
-        av_log(ctx->p2p_context.avctx, AV_LOG_ERROR, "Failed to create probe channel\n");
-        return ret;
-    }
-    
-    set_receiver_state(ctx, RECEIVER_STATE_DATACHANNEL_READY);
     return 0;
 }
 

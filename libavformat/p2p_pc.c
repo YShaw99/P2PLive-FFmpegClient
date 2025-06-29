@@ -15,8 +15,7 @@ int p2p_init_signal_server(P2PContext* const ctx) {
     rtcConfiguration* config = malloc(sizeof(rtcConfiguration));
     memset(config, 0, sizeof(config));
     char* iceServers[] = {
-        "stun:stun.l.google.com:19302",
-        NULL
+        "stun:stun.l.google.com:19302"
     };
     config->iceServersCount = sizeof(iceServers) / sizeof(iceServers[0]);
     config->iceServers = (char**)malloc(config->iceServersCount * sizeof(char*));
@@ -32,7 +31,7 @@ int p2p_init_signal_server(P2PContext* const ctx) {
 
     ctx->config = config;
 
-    const char* web_socket_server_address = "120.53.223.132";
+    const char* web_socket_server_address = "127.0.0.1";//"120.53.223.132";
     const char* web_socket_server_port = "8000";
     init_ws_resource(ctx, web_socket_server_address, web_socket_server_port);
 

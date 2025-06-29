@@ -170,7 +170,6 @@ typedef struct PeerConnectionNode {
     NetworkQualityMetrics network_quality;
 
     P2PCapabilities capabilities;              // 该节点能力集，来自信令或探测
-    P2PRoomInfo room_info;                     // 所在房间信息
 
     struct PeerConnectionNode* next;
 } PeerConnectionNode;
@@ -189,6 +188,7 @@ typedef struct P2PContext {
     // char* web_socket_local_id;
     // char* web_socket_remote_id;
 
+    P2PRoomInfo         room_info;
     PeerConnectionNode* peer_connection_node_caches;
     PeerConnectionNode* selected_node;
 

@@ -16,6 +16,7 @@ typedef enum P2PMessageType {
     P2P_MSG_LEAVE_ROOM,          // 离开房间
     P2P_MSG_ROOM_JOINED,         // 房间加入成功
     P2P_MSG_ROOM_LEFT,           // 房间离开成功
+    P2P_MSG_CONNECT_REQUEST,     // 连接请求（服务器告知主动发送Offer）
     P2P_MSG_OFFER,               // 发送 offer
     P2P_MSG_ANSWER,              // 发送 answer
     P2P_MSG_CANDIDATE,           // 发送 ICE candidate
@@ -29,7 +30,7 @@ typedef enum P2PMessageType {
 
 typedef struct P2PSignalMessage {
     P2PMessageType type;         // 消息类型
-    char* id;                    // 发送者ID
+    char* id;                    // 目标ID
     union {
         struct {
             char* room_id;       // 房间ID
@@ -40,9 +41,12 @@ typedef struct P2PSignalMessage {
         struct {
             char* room_id;       // 房间ID
             char* role;          // 角色
-            int max_receivers;   // 最大接收者数量
-            int current_receivers; // 当前接收者数量
+            char* local_id;      // 本地ID
         } room_joined;
+        
+        struct {
+            char* target_id;     // 目标节点ID（要连接的对象）
+        } connect_request;
         
         struct {
             char* description;   // SDP描述
