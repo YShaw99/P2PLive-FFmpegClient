@@ -219,6 +219,26 @@ int append_peer_connection_track_to_list(PeerConnectionTrack **head, PeerConnect
     return 0;
 }
 
+int append_peer_connection_node_candidate_to_list(PeerConnectionNodeCandidate **head, PeerConnectionNodeCandidate *new_candidate) {
+    if (!head || !new_candidate || !new_candidate->mid[0] || !new_candidate->candidate[0])
+        return AVERROR_INVALIDDATA;
+
+    new_candidate->next = *head;
+    *head = new_candidate;
+    return 0;
+}
+
+int clear_peer_connection_node_candidate_list(PeerConnectionNodeCandidate **head) {
+    PeerConnectionNodeCandidate *curr = *head;
+    while (curr) {
+        PeerConnectionNodeCandidate *next = curr->next;
+        free(curr);
+        curr = next;
+    }
+    *head = NULL;
+    return 0;
+}
+
 int p2p_generate_media_stream_id(char media_stream_id[37]) {
     int ret;
     AVUUID uuid;

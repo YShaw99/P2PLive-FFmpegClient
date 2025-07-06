@@ -10,6 +10,7 @@
 #include "internal.h"
 #include "avio_internal.h"
 #include "p2p_pc.h"
+#include "p2p_probe.h"
 #include "rtpenc.h"
 #include "webrtc.h"
 #include "rtpenc_chain.h"
@@ -18,74 +19,13 @@
 #include "internal.h"
 #include "libavutil/avstring.h"
 
-static int setup_send_track(AVFormatContext* avctx,
-                            AVStream* stream,
-                            PeerConnectionTrack* track,
-                            int index,
-                            rtcTrackInit* track_init)
-{
-    const RTPMuxContext* rtp_mux_ctx = (const RTPMuxContext*)track->rtp_ctx->priv_data;
-    char media_stream_id[37] = {0};
-    int ret;
-
-    // 生成媒体流ID
-    if ((ret = webrtc_generate_media_stream_id(media_stream_id)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to generate media stream id\n");
-        return ret;
-    }
-
-    // 配置轨道唯一参数
-    track_init->direction    = RTC_DIRECTION_SENDONLY;
-    track_init->payloadType  = rtp_mux_ctx->payload_type;
-    track_init->ssrc         = rtp_mux_ctx->ssrc;
-    track_init->mid          = av_asprintf("send-ssrc-%d", track_init->ssrc);
-    track_init->name         = LIBAVFORMAT_IDENT;
-    track_init->msid         = av_strdup(media_stream_id);
-    track_init->trackId      = av_asprintf("%s-send-%d", media_stream_id, index);
-    ret = webrtc_convert_codec(stream->codecpar->codec_id, &track_init->codec);
-
-    return ret;
-}
-
-static int setup_recv_track(AVFormatContext* avctx,
-                            enum AVCodecID stream_codec_id,
-                            PeerConnectionTrack* track,
-                            int index,
-                            int payload_type,
-                            uint32_t ssrc,
-                            rtcTrackInit* track_init)
-{
-    char media_stream_id[37] = {0};
-    int ret;
-
-    // 生成媒体流ID
-    if ((ret = webrtc_generate_media_stream_id(media_stream_id)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to generate media stream id\n");
-        return ret;
-    }
-
-    // 配置轨道唯一参数
-    track_init->direction    = RTC_DIRECTION_RECVONLY;
-    track_init->payloadType  = payload_type;
-    track_init->ssrc         = ssrc;
-    track_init->mid          = av_asprintf("recv-ssrc-%d", track_init->ssrc);
-    track_init->name         = LIBAVFORMAT_IDENT;
-    track_init->msid         = av_strdup(media_stream_id);
-    track_init->trackId      = av_asprintf("%s-recv-%d", media_stream_id, index);
-    ret = webrtc_convert_codec(stream_codec_id, &track_init->codec);
-
-    return ret;
-}
-/* 公共逻辑封装函数（对应原69-119行） */
-static int setup_common_logic(AVFormatContext* avctx,
-                              AVStream* stream,
-                              PeerConnectionNode* node,
-                              PeerConnectionTrack* track,
-                              rtcTrackInit* track_init)
-{
+static int create_track(AVFormatContext* avctx,
+                        AVStream* stream,
+                        PeerConnectionNode* node,
+                        rtcTrackInit* track_init) {
     char sdp_stream[SDP_MAX_SIZE] = {0};
     char* fmtp = NULL;
-    int track_id, ret;
+    int ret;
 
     // 生成SDP描述
     if ((ret = ff_sdp_write_media(sdp_stream, sizeof(sdp_stream),
@@ -109,13 +49,100 @@ static int setup_common_logic(AVFormatContext* avctx,
         }
     }
 
-    if ((track_id = rtcAddTrackEx(node->pc_id, track_init)) <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create Track\n");
-        return AVERROR_EXTERNAL;
+    if ((ret = rtcAddTrackEx(node->pc_id, track_init)) <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create Track, return %d\n", ret);
     }
+
+    return ret;
+}
+
+int create_send_track(AVFormatContext* avctx,
+                      AVStream* stream,
+                      PeerConnectionNode* node,
+                      PeerConnectionTrack* track,
+                      int index) {
+    const RTPMuxContext* rtp_mux_ctx = NULL;
+    char media_stream_id[37] = {0};
+    rtcTrackInit track_init;
+    int ret;
+
+    if ((ret = p2p_rtp_init_urlcontext(track)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "p2p_rtp_init_urlcontext failed\n");
+        return ret;
+    }
+
+    if ((ret = ff_rtp_chain_mux_open(&track->rtp_ctx, avctx, stream,
+                                     track->rtp_url_context, RTP_MAX_PACKET_SIZE, index)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "ff_rtp_chain_mux_open failed\n");
+        return ret;
+    }
+    rtp_mux_ctx = (const RTPMuxContext*)track->rtp_ctx->priv_data;
+
+    if ((ret = webrtc_generate_media_stream_id(media_stream_id)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to generate media stream id\n");
+        return ret;
+    }
+
+    memset(&track_init, 0, sizeof(rtcTrackInit));
+    track_init.direction    = RTC_DIRECTION_SENDONLY;
+    track_init.payloadType  = rtp_mux_ctx->payload_type;
+    track_init.ssrc         = rtp_mux_ctx->ssrc;
+    track_init.mid          = av_asprintf("send-ssrc-%d", track_init.ssrc);
+    track_init.name         = LIBAVFORMAT_IDENT;
+    track_init.msid         = av_strdup(media_stream_id);
+    track_init.trackId      = av_asprintf("%s-send-%d", media_stream_id, index);
+    ret = webrtc_convert_codec(stream->codecpar->codec_id, &track_init.codec);
+
+    if ((ret = create_track(avctx, stream, node, &track_init)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "create_send_track fail %d\n", ret);
+    }
+    return ret;
+}
+
+int create_recv_track(AVFormatContext* avctx,
+                      AVStream* stream,
+                      PeerConnectionNode* node,
+                      PeerConnectionTrack* track,
+                      int index,
+                      int payload_type,
+                      uint32_t ssrc) {
+    char media_stream_id[37] = {0};
+    rtcTrackInit track_init;
+    int ret;
+
+    memset(&track_init, 0, sizeof(rtcTrackInit));
+
+    // 生成媒体流ID
+    if ((ret = webrtc_generate_media_stream_id(media_stream_id)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to generate media stream id\n");
+        return ret;
+    }
+
+    // 配置轨道唯一参数
+    track_init.direction    = RTC_DIRECTION_RECVONLY;
+    track_init.payloadType  = payload_type;
+    track_init.ssrc         = ssrc;
+    track_init.mid          = av_asprintf("recv-ssrc-%d", track_init.ssrc);
+    track_init.name         = LIBAVFORMAT_IDENT;
+    track_init.msid         = av_strdup(media_stream_id);
+    track_init.trackId      = av_asprintf("%s-recv-%d", media_stream_id, index);
+    ret = webrtc_convert_codec(stream->codecpar->codec_id, &track_init.codec);
+
+    if ((ret = create_track(avctx, stream, node, &track_init)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "create_send_track fail %d\n", ret);
+    }
+    return ret;
+}
+
+int setup_track_common_logic(PeerConnectionNode* node,
+                             PeerConnectionTrack* track,
+                             int track_id,
+                             PeerConnectionTrackType track_type) {
+    int ret;
 
     track->avctx = node->avctx;
     track->track_id = track_id;
+    track->track_type = track_type;
     append_peer_connection_track_to_list(&node->track_caches, track);
 
     // 设置回调函数
@@ -123,60 +150,116 @@ static int setup_common_logic(AVFormatContext* avctx,
     if ((ret = rtcSetOpenCallback(track_id, on_track_open_callback)) < 0 ||
         (ret = rtcSetErrorCallback(track_id, on_track_error_callback)) < 0 ||
         (ret = rtcSetClosedCallback(track_id, on_track_close_callback)) < 0
-        // 设置rtcSetMessageCallback后无法通过rtcReceive主动获取。
-        // || (ret = rtcSetMessageCallback(track_id, on_track_message_callback)) < 0
+        // || (ret = rtcSetMessageCallback(track_id, on_track_message_callback)) < 0 // 设置rtcSetMessageCallback后无法通过rtcReceive主动获取。
     ) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to set track callback\n");
+        av_log(node->avctx, AV_LOG_ERROR, "Failed to set track callback\n");
         return AVERROR_EXTERNAL;
     }
 
     return 0;
 }
 
-static int setup_probe_common_logic(AVFormatContext* avctx,
-                                    PeerConnectionNode* node,
-                                    PeerConnectionTrack* track)
-{
-    int dc_id, ret;
+int setup_probe_common_logic(PeerConnectionNode* node,
+                             PeerConnectionTrack* track,
+                             int datachannel_id) {
+    int ret;
+    AVFormatContext* avctx = node->avctx;
+    // 初始化轨道公共属性
 
-    rtcDataChannelInit dc_init = {0};
-    dc_init.reliability.unordered = true;
-    dc_init.reliability.unreliable = true;
-    dc_init.reliability.maxPacketLifeTime = 1000;
+    track->track_type = PeerConnectionTrackType_ProbeChannel;
+    track->stream_index = -1;
+    track->avctx = avctx;
+    track->track_id = datachannel_id;
 
-    if ((dc_id = rtcCreateDataChannelEx(node->pc_id, PROBE_CHANNEL_LABEL, &dc_init)) <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to create probe DataChannel\n");
+    append_peer_connection_track_to_list(&node->track_caches, track);
+
+    // 设置probe专用的回调函数
+    rtcSetUserPointer(datachannel_id, node);
+    if ((ret = rtcSetOpenCallback(datachannel_id, on_probe_channel_open)) < 0 ||
+        (ret = rtcSetErrorCallback(datachannel_id, on_probe_channel_error)) < 0 ||
+        (ret = rtcSetClosedCallback(datachannel_id, on_probe_channel_closed)) < 0 ||
+        (ret = rtcSetMessageCallback(datachannel_id, on_probe_channel_message)) < 0 //probe track无需主动recv，所以设置回调
+    ) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to set probe channel callback\n");
         return AVERROR_EXTERNAL;
     }
 
-    // 初始化轨道公共属性
-    track->avctx = node->avctx;
-    track->track_id = dc_id;
-    track->track_type = PeerConnectionTrackType_ProbeChannel;
-    append_peer_connection_track_to_list(&node->track_caches, track);
-
-    // 设置回调函数
-    rtcSetUserPointer(dc_id, node);
-    if ((ret = rtcSetOpenCallback(dc_id, on_track_open_callback)) < 0 ||
-        (ret = rtcSetErrorCallback(dc_id, on_track_error_callback)) < 0 ||
-        (ret = rtcSetClosedCallback(dc_id, on_track_close_callback)) < 0
-        // || (ret = rtcSetMessageCallback(dc_id, on_track_message_callback)) < 0
-        ) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to set datachannel callback\n");
-        return AVERROR_EXTERNAL;
+    if (!node->probe_track) {
+        node->probe_track = track;
     }
 
     return 0;
+}
+
+int init_send_track_ex(AVFormatContext* avctx,
+                       AVStream* stream,
+                       PeerConnectionNode* const node,
+                       PeerConnectionTrack* const track,
+                       int track_id,
+                       int index) {
+    if (node == NULL || track == NULL || avctx == NULL || stream == NULL) {
+        return AVERROR_INVALIDDATA;
+    }
+
+    rtcTrackInit track_init = {0};
+    const AVCodecParameters* codecpar = stream->codecpar;
+    int ret;
+
+    switch (codecpar->codec_type) {
+        case AVMEDIA_TYPE_VIDEO:
+            avpriv_set_pts_info(stream, 32, 1, 90000); // 视频使用90kHz时钟
+            track->track_type = PeerConnectionTrackType_Video;
+            node->video_track = track;
+            av_log(avctx, AV_LOG_INFO, "Initializing video track for stream %d\n", index);
+            break;
+        case AVMEDIA_TYPE_AUDIO:
+            // 检查音频参数
+            if (codecpar->sample_rate != 48000) {
+                av_log(avctx, AV_LOG_ERROR, "Unsupported sample rate %d. Only 48kHz is supported\n", codecpar->sample_rate);
+                return AVERROR(EINVAL);
+            }
+            avpriv_set_pts_info(stream, 32, 1, codecpar->sample_rate); // 音频使用采样率作为时钟
+            track->track_type = PeerConnectionTrackType_Audio;
+            node->audio_track = track;
+            av_log(avctx, AV_LOG_INFO, "Initializing audio track for stream %d\n", index);
+            break;
+        default:
+            av_log(avctx, AV_LOG_ERROR, "Unsupported codec type for stream %d\n", index);
+            return AVERROR(EINVAL);
+    }
+
+    track->stream_index = index;
+
+    if ((ret = setup_track_common_logic(node, track, track_id, track->track_type)) < 0) {
+        goto fail;
+    }
+
+    av_log(avctx, AV_LOG_INFO, "Successfully initialized %s track for stream %d\n",
+           codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio", index);
+
+    return 0;
+
+fail:
+    if (track->track_id > 0) {
+        rtcDeleteTrack(track->track_id);
+    }
+    if (track->rtp_ctx) {
+        avformat_close_input(&track->rtp_ctx);
+    }
+    return ret;
 }
 
 int init_recv_track_ex(AVFormatContext* avctx,
                        AVStream* stream,
                        PeerConnectionNode* const node,
                        PeerConnectionTrack* const track,
-                       int payload_type,
-                       uint32_t ssrc,
-                       int index)
-{
+                       PeerConnectionTrackType track_type,
+                       int track_id
+                       // ,
+                       // int payload_type,
+                       // uint32_t ssrc,
+                       // int index
+                       ) {
     rtcTrackInit track_init = {0};
     AVDictionary* options = NULL;
     const AVInputFormat* infmt;
@@ -193,8 +276,8 @@ int init_recv_track_ex(AVFormatContext* avctx,
     // if ((ret = setup_recv_track(avctx, stream->codecpar->codec_id, track, index, payload_type, ssrc, &track_init)) < 0) {
     //     goto fail;
     // }
-    //xy:TODO: 应该需要删掉？
-    if ((ret = setup_common_logic(avctx, stream, node, track, &track_init)) < 0) {
+
+    if ((ret = setup_track_common_logic(node, track, track_id, track_type)) < 0) {
         goto fail;
     }
 
@@ -209,6 +292,7 @@ int init_recv_track_ex(AVFormatContext* avctx,
 
     // 4. 初始化 SDP 文件的 IO 上下文
     char sdp_track[SDP_MAX_SIZE] = {0};
+    //这里能拿到对应track的sdp吗？
     ret = rtcGetTrackDescription(track->track_id, sdp_track, sizeof(sdp_track));
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to get track description\n");
@@ -245,108 +329,30 @@ fail:
     return ret;
 }
 
-int init_send_track_ex(AVFormatContext* avctx,
-                       AVStream* stream,
-                       PeerConnectionNode* const node,
-                       PeerConnectionTrack* const track,
-                       int index)
-{
-    if (node == NULL || track == NULL || avctx == NULL || stream == NULL) {
-        return AVERROR_INVALIDDATA;
-    }
-
-    rtcTrackInit track_init = {0};
-    const AVCodecParameters* codecpar = stream->codecpar;
-    int ret;
-
-    // 设置轨道类型和配置PTS信息
-    switch (codecpar->codec_type) {
-        case AVMEDIA_TYPE_VIDEO:
-            avpriv_set_pts_info(stream, 32, 1, 90000); // 视频使用90kHz时钟
-            track->track_type = PeerConnectionTrackType_Video;
-            node->video_track = track;
-            av_log(avctx, AV_LOG_INFO, "Initializing video track for stream %d\n", index);
-            break;
-        case AVMEDIA_TYPE_AUDIO:
-            // 检查音频参数
-            if (codecpar->sample_rate != 48000) {
-                av_log(avctx, AV_LOG_ERROR, "Unsupported sample rate %d. Only 48kHz is supported\n", codecpar->sample_rate);
-                return AVERROR(EINVAL);
-            }
-            avpriv_set_pts_info(stream, 32, 1, codecpar->sample_rate); // 音频使用采样率作为时钟
-            track->track_type = PeerConnectionTrackType_Audio;
-            node->audio_track = track;
-            av_log(avctx, AV_LOG_INFO, "Initializing audio track for stream %d\n", index);
-            break;
-        default:
-            av_log(avctx, AV_LOG_ERROR, "Unsupported codec type for stream %d\n", index);
-            return AVERROR(EINVAL);
-    }
-
-    // 设置流索引
-    track->stream_index = index;
-
-    // 初始化协议上下文
-    if ((ret = p2p_rtp_init_urlcontext(track)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "p2p_rtp_init_urlcontext failed\n");
-        goto fail;
-    }
-
-    // 打开RTP复用器
-    if ((ret = ff_rtp_chain_mux_open(&track->rtp_ctx, avctx, stream,
-                                     track->rtp_url_context, RTP_MAX_PACKET_SIZE, index)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "ff_rtp_chain_mux_open failed\n");
-        goto fail;
-    }
-
-    // 调用独有逻辑
-    if ((ret = setup_send_track(avctx, stream, track, index, &track_init)) < 0) {
-        goto fail;
-    }
-
-    // 调用公共逻辑
-    if ((ret = setup_common_logic(avctx, stream, node, track, &track_init)) < 0) {
-        goto fail;
-    }
-
-    av_log(avctx, AV_LOG_INFO, "Successfully initialized %s track for stream %d\n",
-           codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio", index);
-
-    return 0;
-
-fail:
-    if (track->track_id > 0) {
-        rtcDeleteTrack(track->track_id);
-    }
-    if (track->rtp_ctx) {
-        avformat_close_input(&track->rtp_ctx);
-    }
-    return ret;
-}
 
 int init_probe_track_ex(AVFormatContext* avctx,
                         PeerConnectionNode* const node,
-                        PeerConnectionTrack* const track)
-{
-    int ret;
+                        PeerConnectionTrack* const track) {
     if (node == NULL || track == NULL || avctx == NULL) {
         return AVERROR_INVALIDDATA;
     }
-    av_log(avctx, AV_LOG_INFO, "Initializing probe datachannel\n");
+    int ret, datachannel_id = 0;
 
-    track->track_type = PeerConnectionTrackType_ProbeChannel;
-    track->stream_index = -1;
+    rtcDataChannelInit dc_init = {0};
+    dc_init.reliability.unordered = true;
+    dc_init.reliability.unreliable = true;
+    dc_init.reliability.maxPacketLifeTime = 1000;
 
-    // 调用探测通道公共逻辑
-    if ((ret = setup_probe_common_logic(avctx, node, track)) < 0) {
+    if ((datachannel_id = rtcCreateDataChannelEx(node->pc_id, PROBE_CHANNEL_LABEL, &dc_init)) <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create probe DataChannel\n");
+        return AVERROR_EXTERNAL;
+    }
+
+    if ((ret = setup_probe_common_logic(node, track, datachannel_id)) < 0) {
         goto fail;
     }
 
-    // 设置为探测轨道
-    node->probe_track = track;
-
     av_log(avctx, AV_LOG_INFO, "Successfully initialized probe datachannel\n");
-
     return 0;
 
 fail:
@@ -357,8 +363,7 @@ fail:
 }
 
 // -------- dc callback --------
-void on_track_open_callback(int track_id, void* ptr)
-{
+void on_track_open_callback(int track_id, void* ptr) {
     printf("[FFmpegP2P][Track] on_track_open | track: %d\n", track_id);
     PeerConnectionNode* node = ptr;
     if (find_peer_connection_track_by_track_id(node->track_caches, track_id) == NULL) {
@@ -372,7 +377,7 @@ void on_track_open_callback(int track_id, void* ptr)
     int size2 = 1024;
     int ret;
     rtcDirection direction;
-    
+
     ret = rtcGetTrackDescription(track_id, buffer1, size1);
     if (ret > 0) size1 = ret;
 
@@ -380,7 +385,7 @@ void on_track_open_callback(int track_id, void* ptr)
     if (ret > 0) size2 = ret;
 
     ret = rtcGetTrackDirection(track_id, &direction);
-    
+
     av_log(node->avctx, AV_LOG_INFO, "Track %d opened, direction: %d\n", track_id, direction);
 }
 
@@ -402,7 +407,7 @@ void on_track_error_callback(int track_id, const char *error, void *ptr) {
 
 void on_track_message_callback(int track_id, const char *message, int size, void *ptr) {
     printf("[FFmpegP2P][Track] message! track: %d, message size: %d\n", track_id, size);
-    
+
     PeerConnectionNode *node = ptr;
     if (!node) return;
 

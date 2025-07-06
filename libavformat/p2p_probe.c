@@ -1,12 +1,19 @@
 #include "p2p_probe.h"
 #include "p2p_signal.h"
 #include "rtc/rtc.h"
+#include "libavutil/crc.h"
+#include "libavutil/error.h"
+#include "libavutil/log.h"
+#include "libavutil/random_seed.h"
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "avformat.h"
+#include "p2p_dc.h"
 
 // ==================== 工具函数 ====================
 
@@ -51,43 +58,22 @@ static uint32_t max_uint32(uint32_t a, uint32_t b) {
 // ==================== 核心探测函数实现 ====================
 
 void probe_data_init(NetworkQualityMetrics *data) {
-    //Todo:xy: 这里是否需要初始化其他变量？
     memset(data, 0, sizeof(NetworkQualityMetrics));
     data->start_time = get_current_time_us();
     data->ice_connectivity_score = -1;
-    data->probe_channel_id = -1;
-    data->phase = PROBING_SLOW_START;
-    data->current_packet_size = PROBE_MIN_PACKET_SIZE;
+    data->phase = PROBING_SLOW_START;  // 开始探测
+    data->expected_packets = 0;        // 将在发送时设置
+    data->timeout_ms = 0;              // 将在probe_request中设置
+    data->probe_start_time = 0;        // 将在收到probe_request时设置
+    // data->current_packet_size = PROBE_MIN_PACKET_SIZE;  // 注释：动态包大小
     data->min_rtt = INFINITY;
     data->max_rtt = 0.0;
 }
 
-int create_probe_channel(PeerConnectionNode *node) {
-    rtcDataChannelInit dc_init = {0};
-    dc_init.reliability.unordered = false;
-    dc_init.protocol = "probe";
-    
-    int dc = rtcCreateDataChannel(node->pc_id, PROBE_CHANNEL_LABEL);
-    if (dc <= 0) {
-        printf("[P2P-Probe] ERROR: Failed to create probe channel\n");
-        return -1;
-    }
-    
-    node->network_quality.probe_channel_id = dc;
-    
-    // 设置回调函数
-    rtcSetUserPointer(dc, node);
-    rtcSetOpenCallback(dc, on_probe_channel_open);
-    rtcSetClosedCallback(dc, on_probe_channel_closed);
-    rtcSetMessageCallback(dc, on_probe_channel_message);
-    
-    printf("[P2P-Probe] INFO: Probe channel created with ID %d\n", dc);
-    return 0;
-}
 
 int send_probe_packets(PeerConnectionNode *node) {
-    if (node->network_quality.probe_channel_id <= 0) {
-        printf("[P2P-Probe] ERROR: Probe channel not initialized\n");
+    if (!node->probe_track || node->probe_track->track_id <= 0) {
+        av_log(node->avctx, AV_LOG_ERROR, "[P2P-Probe] Probe track not initialized\n");
         return -1;
     }
 
@@ -96,84 +82,153 @@ int send_probe_packets(PeerConnectionNode *node) {
     
     // 发送不同大小的数据包来测试带宽
     static const uint32_t packet_sizes[] = {
-        64,    // 小包
+        128,    // 小包
+        256,   // 小中包
         512,   // 中包
         1024,  // 大包
-        2048,  // 较大包
-        4096,  // 大包
-        8192   // 最大包
+        1400   // 接近MTU的包
     };
     
-    for (int i = 0; i < PROBE_PACKET_COUNT; i++) {
+    int total_packet_types = sizeof(packet_sizes)/sizeof(packet_sizes[0]);
+    int packets_per_size = 2;  // 每种大小发送n个包
+    int total_packets = total_packet_types * packets_per_size;
+    
+    // 设置预期包数
+    node->network_quality.expected_packets = total_packets;
+    
+    av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Starting probe with %d packets (%d types x %d each)\n", 
+           total_packets, total_packet_types, packets_per_size);
+    
+    for (int i = 0; i < total_packets; i++) {
         memset(&packet, 0, sizeof(ProbePacket));
-        packet.sequence_number = i;
-        packet.send_time = get_current_time_us();
-        packet.packet_size = packet_sizes[i % (sizeof(packet_sizes)/sizeof(packet_sizes[0]))];
-        packet.phase = node->network_quality.phase;
+        packet.header.sequence_number = i;
+        packet.header.send_time = get_current_time_us();
         
-        // 通过探测通道发送数据包
-        ret = rtcSendMessage(node->network_quality.probe_channel_id, 
+        // 按顺序使用包大小：前4个用64字节，接下来4个用256字节，以此类推
+        int size_index = i / packets_per_size;
+        packet.header.packet_size = packet_sizes[size_index];
+        packet.header.phase = node->network_quality.phase;
+        
+        // 计算有效负载大小（减去header大小）
+        uint32_t payload_size = packet.header.packet_size - sizeof(ProbePacketHeader);
+        if (payload_size > sizeof(packet.padding)) {
+            payload_size = sizeof(packet.padding);
+            packet.header.packet_size = sizeof(ProbePacketHeader) + payload_size;
+        }
+        
+        // 用随机数填充有效负载
+        for (uint32_t j = 0; j < payload_size; j++) {
+            packet.padding[j] = (char)(rand() % 256);
+        }
+        
+        // 计算有效负载的CRC32校验和
+        const AVCRC *crc_table = av_crc_get_table(AV_CRC_32_IEEE);
+        uint32_t crc = av_crc(crc_table, 0, (const uint8_t*)packet.padding, payload_size);
+        packet.header.payload_crc = crc;
+        
+        // 发送探测包
+        ret = rtcSendMessage(node->probe_track->track_id, 
                            (const char*)&packet, 
-                           packet.packet_size);
+                           packet.header.packet_size);
         
         if (ret != RTC_ERR_SUCCESS) {
-            printf("[P2P-Probe] ERROR: Failed to send probe packet %d\n", i);
+            av_log(node->avctx, AV_LOG_ERROR, "[P2P-Probe] Failed to send probe packet %d\n", i);
             return -1;
         }
         
         node->network_quality.packets_sent++;
-        printf("[P2P-Probe] DEBUG: Sent probe packet %d, size %u\n", i, packet.packet_size);
-        sleep_ms(100); // 100ms间隔
+        av_log(node->avctx, AV_LOG_DEBUG, "[P2P-Probe] Sent probe packet %d/%d, size %u bytes (type: %d)\n", 
+               i+1, total_packets, packet.header.packet_size, size_index);
+        sleep_ms(100);
     }
     
-    printf("[P2P-Probe] INFO: Sent %d probe packets\n", PROBE_PACKET_COUNT);
+    av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Sent all %d probe packets\n", total_packets);
     return 0;
 }
 
 void handle_probe_packet(PeerConnectionNode *node, const char *data, int size) {
-    if (size < sizeof(ProbePacket)) {
-        return;
-    }
-
     ProbePacket *packet = (ProbePacket *)data;
     NetworkQualityMetrics *metrics = &node->network_quality;
     int64_t now = get_current_time_us();
     
-    // 更新统计数据
+    // 验证接收到的数据大小是否至少包含header
+    if (size < sizeof(ProbePacketHeader)) {
+        av_log(node->avctx, AV_LOG_WARNING, "[P2P-Probe] Received probe packet size %d, min expected %zu\n", 
+               size, sizeof(ProbePacketHeader));
+        return;
+    }
+    // 验证接收到的数据大小与header记录是否一致
+    if (size != (int)packet->header.packet_size) {
+        av_log(node->avctx, AV_LOG_WARNING, "[P2P-Probe] Size mismatch! Received %d bytes, header says %u bytes\n", 
+               size, packet->header.packet_size);
+        return;
+    }
+    
+    // 验证数据完整性
+    uint32_t payload_size = packet->header.packet_size - sizeof(ProbePacketHeader);
+    if (payload_size > sizeof(packet->padding)) {
+        av_log(node->avctx, AV_LOG_WARNING, "[P2P-Probe] Invalid payload size %u, max %zu\n", 
+               payload_size, sizeof(packet->padding));
+        abort();
+        return;
+    }
+    
+    // 计算接收到的负载的CRC32校验和并验证
+    const AVCRC *crc_table = av_crc_get_table(AV_CRC_32_IEEE);
+    uint32_t calculated_crc = av_crc(crc_table, 0, (const uint8_t*)packet->padding, payload_size);
+    if (calculated_crc != packet->header.payload_crc) {
+        av_log(node->avctx, AV_LOG_WARNING, "[P2P-Probe] CRC mismatch! Expected %u, got %u\n", 
+               packet->header.payload_crc, calculated_crc);
+        // 数据损坏，不计入统计
+        abort();
+        return;
+    }
+    
+    // 更新统计数据（使用packet_size作为模拟的网络传输大小）
     metrics->packets_received++;
-    metrics->bytes_received += packet->packet_size;
+    metrics->bytes_received += packet->header.packet_size;
     metrics->last_recv_time = now;
     
     // 计算RTT
-    double rtt = (now - packet->send_time) / 1000.0; // 转换为毫秒
+    double rtt = (now - packet->header.send_time) / 1000.0; // 转换为毫秒
     metrics->rtt_sum += rtt;
     metrics->rtt_count++;
     
-    // 检测拥塞
-    detect_congestion(metrics, rtt);
+    // 更新RTT范围
+    if (metrics->rtt_count == 1) {
+        metrics->min_rtt = metrics->max_rtt = rtt;
+    } else {
+        metrics->min_rtt = min_double(metrics->min_rtt, rtt);
+        metrics->max_rtt = max_double(metrics->max_rtt, rtt);
+    }
     
-    // 计算丢包率
-    if (metrics->packets_sent > 0) {
-        metrics->packet_loss_rate = 1.0 - ((double)metrics->packets_received / metrics->packets_sent);
+    // 计算丢包率 - 修复：使用expected_packets而不是packets_sent
+    if (metrics->expected_packets > 0) {
+        metrics->packet_loss_rate = 1.0 - ((double)metrics->packets_received / metrics->expected_packets);
+    } else {
+        metrics->packet_loss_rate = 0.0; // 没有预期包数时默认为0
     }
     
     // 计算带宽 (kbps)
     double duration = (now - metrics->start_time) / 1000000.0; // 转换为秒
     if (duration > 0) {
         metrics->bandwidth_kbps = (metrics->bytes_received * 8.0 / 1024.0) / duration;
-        
-        // 更新探测阶段
-        update_probing_phase(metrics);
-        
-        // 调整下一个包的大小
-        adjust_packet_size(metrics);
     }
     
-    printf("[P2P-Probe] DEBUG: Received packet %u, RTT=%.2f ms, BW=%.2f kbps\n", 
-           packet->sequence_number, rtt, metrics->bandwidth_kbps);
+    // 检查是否收到了所有预期的包
+    if (metrics->expected_packets > 0 && 
+        metrics->packets_received >= metrics->expected_packets) {
+        metrics->phase = PROBING_COMPLETE;
+        av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Probing completed! Received %d/%d packets\n",
+               metrics->packets_received, metrics->expected_packets);
+    }
+    
+    av_log(node->avctx, AV_LOG_DEBUG, "[P2P-Probe] Received packet %u (%d/%d), RTT=%.2f ms, BW=%.2f kbps, Loss=%.2f%%\n", 
+           packet->header.sequence_number, metrics->packets_received, metrics->expected_packets,
+           rtt, metrics->bandwidth_kbps, metrics->packet_loss_rate * 100);
 }
 
-double calculate_node_score(NetworkQualityMetrics *data) {
+double calculate_node_score(AVFormatContext *avctx, NetworkQualityMetrics *data) {
     if (data->packets_received == 0) {
         return 0.0;
     }
@@ -203,7 +258,7 @@ double calculate_node_score(NetworkQualityMetrics *data) {
     // 总分 (0-100分)
     data->final_score = rtt_score + packet_loss_score + bandwidth_score + ice_score;
     
-    printf("[P2P-Probe] INFO: Node score calculation - RTT:%.1f, Loss:%.1f, BW:%.1f, ICE:%.1f, Total:%.1f\n",
+    av_log(avctx, AV_LOG_INFO, "[P2P-Probe] Node score calculation - RTT:%.1f, Loss:%.1f, BW:%.1f, ICE:%.1f, Total:%.1f\n",
            rtt_score, packet_loss_score, bandwidth_score, ice_score, data->final_score);
     
     return data->final_score;
@@ -214,11 +269,11 @@ PeerConnectionNode* select_best_node(P2PContext *ctx) {
     PeerConnectionNode *best_node = NULL;
     double best_score = 0.0;
     
-    printf("[P2P-Probe] INFO: Selecting best node from available candidates\n");
+    av_log(ctx->avctx, AV_LOG_INFO, "[P2P-Probe] Selecting best node from available candidates\n");
     
     while (curr) {
-        double score = calculate_node_score(&curr->network_quality);
-        printf("[P2P-Probe] INFO: Node %s score: %.2f\n", curr->remote_id, score);
+        double score = calculate_node_score(ctx->avctx, &curr->network_quality);
+        av_log(ctx->avctx, AV_LOG_INFO, "[P2P-Probe] Node %s score: %.2f\n", curr->remote_id, score);
         
         if (score > best_score) {
             best_score = score;
@@ -228,10 +283,10 @@ PeerConnectionNode* select_best_node(P2PContext *ctx) {
     }
     
     if (best_node) {
-        printf("[P2P-Probe] INFO: Selected node %s with score %.2f\n", 
+        av_log(ctx->avctx, AV_LOG_INFO, "[P2P-Probe] Selected node %s with score %.2f\n", 
                best_node->remote_id, best_score);
     } else {
-        printf("[P2P-Probe] WARNING: No suitable node found\n");
+        av_log(ctx->avctx, AV_LOG_WARNING, "[P2P-Probe] No suitable node found\n");
     }
     
     return best_node;
@@ -241,207 +296,83 @@ PeerConnectionNode* select_best_node(P2PContext *ctx) {
 
 void on_probe_channel_open(int dc, void *ptr) {
     PeerConnectionNode *node = ptr;
-    printf("[P2P-Probe] INFO: Probe channel %d opened for node %s\n", dc, node->remote_id);
+    PeerConnectionTrack* track = NULL;
+    av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Probe channel %d opened for node %s\n", dc, node->remote_id);
+    
+    if ((track = find_peer_connection_track_by_track_id(node->track_caches, dc)) == NULL) {
+        track = av_mallocz(sizeof(PeerConnectionTrack));
+        if (!track) {
+            av_log(node->avctx, AV_LOG_ERROR, "[P2P-Probe] Failed to allocate probe track\n");
+            return;
+        }
+
+        int ret = setup_probe_common_logic(node, track, dc);
+        if (ret < 0) {
+            av_log(node->avctx, AV_LOG_ERROR, "[P2P-Probe] Failed to setup probe track for data channel %d\n", dc);
+            av_freep(&track);
+            return;
+        }
+
+        av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Created probe track for data channel %d\n", dc);
+    }
+    
+    rtcSetUserPointer(dc, node);
+    rtcSetOpenCallback(dc, on_probe_channel_open);
+    rtcSetErrorCallback(dc, on_probe_channel_error);
+    rtcSetClosedCallback(dc, on_probe_channel_closed);
+    rtcSetMessageCallback(dc, on_probe_channel_message);
+
+    if (node && !node->probe_track && track->track_type == PeerConnectionTrackType_ProbeChannel) {
+        node->probe_track = track;
+    }
+}
+
+void on_probe_channel_error(int dc, const char *error, void *ptr) {
+    PeerConnectionNode *node = ptr;
+    av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Probe channel %d happened error for node %s, error:%s\n", dc, node->remote_id, error);
 }
 
 void on_probe_channel_closed(int dc, void *ptr) {
     PeerConnectionNode *node = ptr;
-    printf("[P2P-Probe] INFO: Probe channel %d closed for node %s\n", dc, node->remote_id);
+    av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Probe channel %d closed for node %s\n", dc, node->remote_id);
 }
 
 void on_probe_channel_message(int dc, const char *msg, int size, void *ptr) {
     PeerConnectionNode *node = ptr;
-    printf("[P2P-Probe] DEBUG: Received message on probe channel %d, size %d\n", dc, size);
+    av_log(node->avctx, AV_LOG_DEBUG, "[P2P-Probe] Received message on probe channel %d, size %d\n", dc, size);
     handle_probe_packet(node, msg, size);
-}
-
-// ==================== 高级探测算法函数实现 ====================
-
-void update_probing_phase(NetworkQualityMetrics *data) {
-    int64_t now = get_current_time_us();
-    double duration = (now - data->start_time) / 1000000.0; // 转换为秒
-    
-    switch (data->phase) {
-        case PROBING_SLOW_START:
-            // 如果带宽增长率开始下降，或者已经达到目标带宽，进入带宽估计阶段
-            if (data->bandwidth_kbps >= TARGET_BANDWIDTH_KBPS ||
-                (data->packets_received > 5 && 
-                 data->bandwidth_kbps < data->peak_bandwidth_kbps * 0.8)) {
-                data->phase = PROBING_BANDWIDTH;
-                data->peak_bandwidth_kbps = data->bandwidth_kbps;
-                printf("[P2P-Probe] INFO: Phase transition: SLOW_START -> BANDWIDTH\n");
-            }
-            break;
-            
-        case PROBING_BANDWIDTH:
-            // 如果带宽稳定或者发生拥塞，进入验证阶段
-            if (data->congestion_count > 0 ||
-                (data->packets_received > 10 && 
-                 fabs(data->bandwidth_kbps - data->peak_bandwidth_kbps) < 
-                 data->peak_bandwidth_kbps * 0.1)) {
-                data->phase = PROBING_VERIFICATION;
-                data->stable_bandwidth_kbps = data->bandwidth_kbps;
-                printf("[P2P-Probe] INFO: Phase transition: BANDWIDTH -> VERIFICATION\n");
-            }
-            break;
-            
-        case PROBING_VERIFICATION:
-            // 如果验证阶段的带宽与稳定带宽相差不大，完成探测
-            if (data->packets_received > 15 && 
-                fabs(data->bandwidth_kbps - data->stable_bandwidth_kbps) < 
-                data->stable_bandwidth_kbps * 0.1) {
-                data->phase = PROBING_COMPLETE;
-                printf("[P2P-Probe] INFO: Phase transition: VERIFICATION -> COMPLETE\n");
-            }
-            break;
-            
-        default:
-            break;
-    }
-}
-
-int adjust_packet_size(NetworkQualityMetrics *data) {
-    switch (data->phase) {
-        case PROBING_SLOW_START:
-            // 慢启动阶段，指数增加包大小
-            data->current_packet_size = min_uint32(
-                data->current_packet_size * 2,
-                PROBE_MAX_PACKET_SIZE
-            );
-            break;
-            
-        case PROBING_BANDWIDTH:
-            // 带宽估计阶段，线性增加包大小
-            data->current_packet_size = min_uint32(
-                data->current_packet_size + PROBE_MIN_PACKET_SIZE,
-                PROBE_MAX_PACKET_SIZE
-            );
-            break;
-            
-        case PROBING_VERIFICATION:
-            // 验证阶段，使用较大的固定包大小
-            data->current_packet_size = PROBE_MAX_PACKET_SIZE * 3 / 4;
-            break;
-            
-        default:
-            return -1;
-    }
-    
-    return 0;
-}
-
-void detect_congestion(NetworkQualityMetrics *data, double current_rtt) {
-    int64_t now = get_current_time_us();
-    
-    // 更新RTT统计
-    if (data->rtt_count == 0) {
-        data->min_rtt = data->max_rtt = current_rtt;
-    } else {
-        data->min_rtt = min_double(data->min_rtt, current_rtt);
-        data->max_rtt = max_double(data->max_rtt, current_rtt);
-    }
-    
-    // 检测拥塞
-    bool is_congested = false;
-    
-    // 条件1: RTT显著增加
-    if (current_rtt > data->min_rtt * 2) {
-        is_congested = true;
-    }
-    
-    // 条件2: 丢包率超过阈值
-    if (data->packet_loss_rate > MAX_PACKET_LOSS) {
-        is_congested = true;
-    }
-    
-    // 条件3: 带宽突然下降
-    if (data->bandwidth_kbps < data->peak_bandwidth_kbps * 0.7) {
-        is_congested = true;
-    }
-    
-    if (is_congested) {
-        // 如果距离上次拥塞超过1秒
-        if (now - data->last_congestion_time > 1000000) {
-            data->congestion_count++;
-            data->last_congestion_time = now;
-            
-            // 拥塞发生时减小包大小
-            data->current_packet_size = max_uint32(
-                data->current_packet_size / 2,
-                PROBE_MIN_PACKET_SIZE
-            );
-            
-            printf("[P2P-Probe] WARNING: Congestion detected, count=%d\n", data->congestion_count);
-        }
-    }
-}
-
-double estimate_available_bandwidth(NetworkQualityMetrics *data) {
-    if (data->phase != PROBING_COMPLETE) {
-        return 0.0;
-    }
-    
-    // 使用稳定带宽作为基准
-    double estimated_bw = data->stable_bandwidth_kbps;
-    
-    // 根据RTT波动调整
-    if (data->max_rtt > 0) {
-        double rtt_ratio = data->min_rtt / data->max_rtt;
-        estimated_bw *= rtt_ratio;
-    }
-    
-    // 根据丢包率调整
-    estimated_bw *= (1.0 - data->packet_loss_rate);
-    
-    // 确保不超过峰值带宽
-    estimated_bw = min_double(estimated_bw, data->peak_bandwidth_kbps);
-    
-    // 确保不低于最低带宽要求
-    estimated_bw = max_double(estimated_bw, MIN_BANDWIDTH_KBPS);
-    
-    printf("[P2P-Probe] INFO: Estimated available bandwidth: %.2f kbps\n", estimated_bw);
-    return estimated_bw;
 } 
 
 // ==================== 探测相关函数 ====================
 
-int handle_probe_request(PeerConnectionNode* node, const char* msg, int size) {
-    P2PContext* p2p_ctx = node->p2p_ctx;
-    av_log(p2p_ctx->avctx, AV_LOG_DEBUG, 
-           "Handling probe request from receiver %s\n", node->remote_id);
-    
-    // 创建探测通道（如果还没有）
-    if (node->network_quality.probe_channel_id <= 0) {
-        int dc = rtcCreateDataChannel(node->pc_id, PROBE_CHANNEL_LABEL);
-        if (dc <= 0) {
-            av_log(p2p_ctx->avctx, AV_LOG_ERROR, "Failed to create probe channel\n");
-            return AVERROR_EXTERNAL;
-        }
-        node->network_quality.probe_channel_id = dc;
-        rtcSetUserPointer(dc, node);
-    }
-    
-    // 开始发送探测数据包
-    return send_probe_packets(node);
-}
-
 int send_probe_request_to_publisher(P2PContext* p2p_ctx, PeerConnectionNode* node) {
-    P2PSignalMessage* msg = p2p_create_signal_message(P2P_MSG_PROBE_REQUEST, node->remote_id);
+    P2PSignalMessage* msg = p2p_create_signal_message(P2P_MSG_PROBE_REQUEST, p2p_ctx->local_id, node->remote_id);
     if (!msg) {
         return AVERROR(ENOMEM);
     }
-    
-    // 生成探测ID
+
     char probe_id[64];
     snprintf(probe_id, sizeof(probe_id), "probe_%08x", av_get_random_seed());
+
+    static const uint32_t packet_sizes[] = {128, 256, 512, 1024, 1400};
+    int total_packet_types = sizeof(packet_sizes)/sizeof(packet_sizes[0]);
+    int packets_per_size = 2;
+    int expected_packets = total_packet_types * packets_per_size;
+    int timeout_ms = PROBE_TIMEOUT_MS;
     
     msg->payload.probe_request.probe_id = strdup(probe_id);
     msg->payload.probe_request.packet_size = 1024;
+    msg->payload.probe_request.expected_packets = expected_packets;
+    msg->payload.probe_request.timeout_ms = timeout_ms;
+    
+    node->network_quality.expected_packets = expected_packets;
+    node->network_quality.timeout_ms = timeout_ms;
+    node->network_quality.probe_start_time = get_current_time_us();  // 记录探测开始时间
     
     int ret = p2p_send_signal_message(p2p_ctx, msg);
     
-    av_log(p2p_ctx->avctx, AV_LOG_INFO, "Sent probe request to %s, probe_id=%s\n", 
-           node->remote_id, probe_id);
+    av_log(p2p_ctx->avctx, AV_LOG_INFO, "Sent probe request to %s, probe_id=%s, expected_packets=%d, timeout=%dms (start_time set)\n", 
+           node->remote_id, probe_id, expected_packets, timeout_ms);
     
     p2p_free_signal_message(msg);
     return ret;
@@ -453,7 +384,7 @@ int send_stream_request(P2PContext* p2p_ctx, PeerConnectionNode* node) {
         return AVERROR(EINVAL);
     }
     
-    P2PSignalMessage* msg = p2p_create_signal_message(P2P_MSG_STREAM_REQUEST, node->remote_id);
+    P2PSignalMessage* msg = p2p_create_signal_message(P2P_MSG_STREAM_REQUEST, p2p_ctx->local_id, node->remote_id);
     if (!msg) {
         return AVERROR(ENOMEM);
     }

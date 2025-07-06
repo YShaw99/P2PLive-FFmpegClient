@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <time.h>
 #include <stdbool.h>
 #include <errno.h>
@@ -31,28 +32,21 @@ struct P2PSignalCallbacks;
 struct P2PContext;
 struct P2PSignalMessage;
 
-// 信令消息处理回调函数类型
-typedef int (*P2PSignalMessageHandler)(struct P2PContext* ctx, const struct P2PSignalMessage* msg);
-
-// 信令回调结构体
-typedef struct P2PSignalCallbacks {
-    P2PSignalMessageHandler message_handler;    // 消息处理回调
-    void* user_data;                           // 用户自定义数据
-} P2PSignalCallbacks;
-
-
 #define SDP_MAX_SIZE 8192
 #define P2P_RTP_MAX_PACKET_SIZE 1450
 // 带宽探测相关常量
 #define PROBE_MIN_PACKET_SIZE 64     // 最小探测包大小(字节)
-#define PROBE_MAX_PACKET_SIZE 8192   // 最大探测包大小(字节)
+#define PROBE_MAX_PACKET_SIZE 1500   // 最大探测包大小(字节)，接近MTU大小
 #define PROBE_PACKET_COUNT 20        // 每轮探测发送的包数
-#define PROBE_TIMEOUT_MS 5000        // 探测超时时间(毫秒)
+#define PROBE_TIMEOUT_MS 5000*1000        // 探测超时时间(毫秒)
 #define MIN_BANDWIDTH_KBPS 500       // 最低带宽要求(kbps)
 #define TARGET_BANDWIDTH_KBPS 2000   // 目标带宽(kbps)
 #define MAX_RTT_MS 1000              // 最大可接受RTT(毫秒)
 #define MAX_PACKET_LOSS 0.1          // 最大可接受丢包率(0-1)
 #define PROBE_CHANNEL_LABEL "probe_channel"  // 探测通道标签
+#define P2P_VIDEO_PAYLOAD_TYPE 96
+#define P2P_AUDIO_PAYLOAD_TYPE 97
+#define P2P_WAITING_RECEIVER_TIMEOUT_SEC 30*100//debug        // 等待拉流端超时时间(秒)
 
 // 带宽探测阶段
 typedef enum ProbingPhase {
@@ -72,25 +66,32 @@ typedef struct NetworkQualityMetrics {
     uint64_t bytes_received;   // 接收到的总字节数，用于计算带宽
     double packet_loss_rate;   // 丢包率(0-1)
     double bandwidth_kbps;     // 测量的带宽(kbps)
-    double peak_bandwidth_kbps; // 峰值带宽(kbps)
-    double stable_bandwidth_kbps; // 稳定带宽(kbps)
+    // double peak_bandwidth_kbps; // 峰值带宽(kbps)
+    // double stable_bandwidth_kbps; // 稳定带宽(kbps)
     int ice_connectivity_score; // ICE连接质量得分(0-100)
     double final_score;        // 最终综合评分(0-100)
-    int probe_channel_id;      // 探测通道ID
     ProbingPhase phase;        // 当前探测阶段
-    uint32_t current_packet_size; // 当前使用的数据包大小
-    int64_t last_congestion_time; // 上次发生拥塞的时间
+    int expected_packets;      // 预期接收的总包数
+    int timeout_ms;            // 探测超时时间(毫秒)
+    int64_t probe_start_time;  // 探测开始时间戳(微秒)，用于超时计算
+    // uint32_t current_packet_size; // 当前使用的数据包大小
+    // int64_t last_congestion_time; // 上次发生拥塞的时间
     double min_rtt;            // 最小RTT(毫秒)
     double max_rtt;            // 最大RTT(毫秒)
-    int congestion_count;      // 拥塞次数
+    // int congestion_count;      // 拥塞次数
 } NetworkQualityMetrics;
 
-typedef struct ProbePacket {
+typedef struct ProbePacketHeader {
     uint32_t sequence_number;   // 序列号，用于检测丢包
     int64_t send_time;         // 发送时间戳，用于计算RTT
-    uint32_t packet_size;      // 数据包大小，用于带宽测试
+    uint32_t packet_size;      // 有效数据大小，用于带宽测试
     ProbingPhase phase;        // 发送时的探测阶段
-    char padding[PROBE_MAX_PACKET_SIZE - 2 * sizeof(uint32_t) - sizeof(int64_t) - sizeof(ProbingPhase)];
+    uint32_t payload_crc;      // 有效负载的CRC32校验值
+} ProbePacketHeader;
+
+typedef struct ProbePacket {
+    ProbePacketHeader header;
+    char padding[PROBE_MAX_PACKET_SIZE - sizeof(ProbePacketHeader)];
 } ProbePacket;
 
 typedef enum PeerConnectionStatus {
@@ -153,6 +154,11 @@ typedef struct PeerConnectionTrack {
     struct PeerConnectionTrack* next;
 } PeerConnectionTrack;
 
+typedef struct PeerConnectionNodeCandidate {
+    char candidate[512];
+    char mid[32];
+    struct PeerConnectionNodeCandidate* next;
+} PeerConnectionNodeCandidate;
 
 // User 级别
 typedef struct PeerConnectionNode {
@@ -161,15 +167,17 @@ typedef struct PeerConnectionNode {
     const char *remote_id;
     int pc_id;                                  // peer_connection Wrap(function)
     // NetworkQuality NetworkQualityWhenInit;   //xy:Todo:如何动态更新P2P的网络状态？
+    // int inited;
     PeerConnectionStatus status;
     PeerConnectionTrack* track_caches;
     PeerConnectionTrack* video_track;
     PeerConnectionTrack* audio_track;
     PeerConnectionTrack* probe_track;
+    PeerConnectionNodeCandidate* candidate_caches;
     
     NetworkQualityMetrics network_quality;
 
-    P2PCapabilities capabilities;              // 该节点能力集，来自信令或探测
+    // P2PCapabilities capabilities;              // 该节点能力集，来自信令或探测
 
     struct PeerConnectionNode* next;
 } PeerConnectionNode;
@@ -192,11 +200,16 @@ typedef struct P2PContext {
     PeerConnectionNode* peer_connection_node_caches;
     PeerConnectionNode* selected_node;
 
-    int waiting_for_sender; // debug,当前没办法阻塞等待，recv端先设置一个flag，启动后一直等待send端连接
-
     // Added for callbacks
     struct P2PSignalCallbacks* signal_callbacks;
 } P2PContext;
+
+typedef struct P2PSignalCallbacks {
+    void* user_data;
+    int (*on_ws_messaged)(P2PContext* ctx, const struct P2PSignalMessage* msg);
+    void (*on_pc_connected)(P2PContext* ctx, PeerConnectionNode* node);
+} P2PSignalCallbacks;
+
 
 void *p2p_main(void *arg);
 int p2p_close_resource(P2PContext* const ctx);
@@ -213,6 +226,9 @@ int remove_peer_connection_track_from_list(PeerConnectionTrack **head, const int
 int release_peer_connection_track(PeerConnectionTrack* node);
 PeerConnectionTrack* find_peer_connection_track_by_track_id(PeerConnectionTrack *head, int track_id);
 PeerConnectionTrack* find_peer_connection_track_by_stream_index(PeerConnectionTrack *head, int stream_index);
+
+int append_peer_connection_node_candidate_to_list(PeerConnectionNodeCandidate **head, PeerConnectionNodeCandidate *new_candidate);
+int clear_peer_connection_node_candidate_list(PeerConnectionNodeCandidate **head);
 
 int p2p_generate_media_stream_id(char media_stream_id[37]);
 

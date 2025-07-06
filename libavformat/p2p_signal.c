@@ -23,8 +23,11 @@ int p2p_send_signal_message(P2PContext* ctx, const P2PSignalMessage* msg) {
     if (!json) return AVERROR(ENOMEM);
     
     // 添加基本字段
-    cJSON_AddStringToObject(json, "id", msg->id);
     cJSON_AddStringToObject(json, "type", p2p_message_type_to_string(msg->type));
+    if (msg->sender_id)
+        cJSON_AddStringToObject(json, "sender_id", msg->sender_id);
+    if (msg->receiver_id)
+        cJSON_AddStringToObject(json, "receiver_id", msg->receiver_id);
     
     // 根据消息类型添加特定字段
     switch (msg->type) {
@@ -62,6 +65,8 @@ int p2p_send_signal_message(P2PContext* ctx, const P2PSignalMessage* msg) {
         case P2P_MSG_PROBE_REQUEST:
             cJSON_AddStringToObject(json, "probe_id", msg->payload.probe_request.probe_id);
             cJSON_AddNumberToObject(json, "packet_size", msg->payload.probe_request.packet_size);
+            cJSON_AddNumberToObject(json, "expected_packets", msg->payload.probe_request.expected_packets);
+            cJSON_AddNumberToObject(json, "timeout_ms", msg->payload.probe_request.timeout_ms);
             break;
             
         case P2P_MSG_PROBE_RESPONSE:
@@ -96,22 +101,26 @@ int p2p_handle_signal_message(P2PContext* ctx, const char* message, int size) {
     if (!json) return AVERROR(EINVAL);
     
     // 解析基本字段
-    cJSON* id_json = cJSON_GetObjectItem(json, "id");
+    cJSON* sender_id_json = cJSON_GetObjectItem(json, "sender_id");
+    cJSON* receiver_id_json = cJSON_GetObjectItem(json, "receiver_id");
     cJSON* type_json = cJSON_GetObjectItem(json, "type");
     
-    if (!cJSON_IsString(id_json) || !cJSON_IsString(type_json)) {
+    if (!cJSON_IsString(type_json)) {
         cJSON_Delete(json);
         return AVERROR(EINVAL);
     }
     
-    P2PSignalMessage* msg = av_mallocz(sizeof(P2PSignalMessage));
+    // 获取消息类型和ID信息
+    P2PMessageType msg_type = p2p_string_to_message_type(type_json->valuestring);
+    const char* sender_id = cJSON_IsString(sender_id_json) ? sender_id_json->valuestring : NULL;
+    const char* receiver_id = cJSON_IsString(receiver_id_json) ? receiver_id_json->valuestring : NULL;
+    
+    // 使用统一的创建接口
+    P2PSignalMessage* msg = p2p_create_signal_message(msg_type, sender_id, receiver_id);
     if (!msg) {
         cJSON_Delete(json);
         return AVERROR(ENOMEM);
     }
-    
-    msg->id = strdup(id_json->valuestring);
-    msg->type = p2p_string_to_message_type(type_json->valuestring);
     
     // 根据消息类型解析特定字段
     switch (msg->type) {
@@ -195,12 +204,20 @@ int p2p_handle_signal_message(P2PContext* ctx, const char* message, int size) {
             {
                 cJSON* probe_id_json = cJSON_GetObjectItem(json, "probe_id");
                 cJSON* packet_size_json = cJSON_GetObjectItem(json, "packet_size");
+                cJSON* expected_packets_json = cJSON_GetObjectItem(json, "expected_packets");
+                cJSON* timeout_ms_json = cJSON_GetObjectItem(json, "timeout_ms");
                 
                 if (cJSON_IsString(probe_id_json)) {
                     msg->payload.probe_request.probe_id = strdup(probe_id_json->valuestring);
                 }
                 if (cJSON_IsNumber(packet_size_json)) {
                     msg->payload.probe_request.packet_size = packet_size_json->valueint;
+                }
+                if (cJSON_IsNumber(expected_packets_json)) {
+                    msg->payload.probe_request.expected_packets = expected_packets_json->valueint;
+                }
+                if (cJSON_IsNumber(timeout_ms_json)) {
+                    msg->payload.probe_request.timeout_ms = timeout_ms_json->valueint;
                 }
             }
             break;
@@ -253,8 +270,8 @@ int p2p_handle_signal_message(P2PContext* ctx, const char* message, int size) {
     
     // 调用回调函数处理消息
     int ret = 0;
-    if (ctx->signal_callbacks && ctx->signal_callbacks->message_handler) {
-        ret = ctx->signal_callbacks->message_handler(ctx, msg);
+    if (ctx->signal_callbacks && ctx->signal_callbacks->on_ws_messaged) {
+        ret = ctx->signal_callbacks->on_ws_messaged(ctx, msg);
     }
     
     p2p_free_signal_message(msg);
@@ -266,9 +283,14 @@ void p2p_free_signal_message(P2PSignalMessage* msg) {
         return;
     }
 
-    if (msg->id) {
-        free(msg->id);
-        msg->id = NULL;
+    if (msg->sender_id) {
+        free(msg->sender_id);
+        msg->sender_id = NULL;
+    }
+    
+    if (msg->receiver_id) {
+        free(msg->receiver_id);
+        msg->receiver_id = NULL;
     }
 
     // 根据消息类型释放对应的payload内存
@@ -340,17 +362,16 @@ void p2p_free_signal_message(P2PSignalMessage* msg) {
 
 // ==================== 工具函数实现 ====================
 P2PSignalMessage* p2p_create_signal_message(P2PMessageType type,
-                                            const char* sender_id) {
+                                            const char* sender_id,
+                                            const char* receiver_id) {
     P2PSignalMessage* msg = (P2PSignalMessage*)malloc(sizeof(P2PSignalMessage));
     if (!msg) return NULL;
     memset(msg, 0, sizeof(P2PSignalMessage));
 
     msg->type = type;
-    if (sender_id) {
-        msg->id = strdup(sender_id);
-    } else {
-        msg->id = NULL;
-    }
+    msg->sender_id = sender_id ? strdup(sender_id) : NULL;
+    msg->receiver_id = receiver_id ? strdup(receiver_id) : NULL;
+    
     // 其余payload字段由调用者后续赋值
     // 这里只做初始化，payload union内容全部置0
     memset(&msg->payload, 0, sizeof(msg->payload));
@@ -400,7 +421,8 @@ P2PMessageType p2p_string_to_message_type(const char* type_str) {
 // ==================== 回调管理函数 ====================
 
 int p2p_set_signal_message_handler(P2PContext* ctx, 
-                                   int (*handler)(P2PContext*, const P2PSignalMessage*),
+                                   int (*on_ws_messaged)(P2PContext*, const P2PSignalMessage*),
+                                   void (*on_pc_connected)(P2PContext* ctx, PeerConnectionNode* node),
                                    void* user_data) {
     if (!ctx) return AVERROR(EINVAL);
     
@@ -411,7 +433,8 @@ int p2p_set_signal_message_handler(P2PContext* ctx,
         }
     }
     
-    ctx->signal_callbacks->message_handler = handler;
+    ctx->signal_callbacks->on_ws_messaged = on_ws_messaged;
+    ctx->signal_callbacks->on_pc_connected = on_pc_connected;
     ctx->signal_callbacks->user_data = user_data;
     
     return 0;

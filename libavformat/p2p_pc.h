@@ -22,6 +22,10 @@ void on_pc_data_channel_callback(int peer_connection_id, int dc, void *ptr);
 void on_pc_track_callback(int peer_connection_id, int tr, void *ptr);
 
 int p2p_init_signal_server(P2PContext* const ctx);
-int init_peer_connection(P2PContext* const ctx, const char* remote_id);
+int create_peer_connection(P2PContext* const ctx, const char* remote_id);
+int init_peer_connection(P2PContext* const ctx, int peer_connection_id);
+// int init_peer_connection(P2PContext* const ctx, const char* remote_id);
+
+int send_local_description(P2PContext* const ctx, PeerConnectionNode* const node, char* role);
 
 #endif //P2P_PC_H

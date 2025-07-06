@@ -30,6 +30,7 @@ OBJS = allformats.o         \
        url.o                \
        utils.o              \
        version.o            \
+       p2p_ws.o p2p_dc.o p2p_pc.o p2p.o p2p_probe.o p2p_signal.o p2p_rtp_demux.o p2p_rtp_mux.o
 
 OBJS-$(HAVE_LIBC_MSVCRT)                 += file_open.o
 
@@ -623,6 +624,9 @@ OBJS-$(CONFIG_WEBVTT_DEMUXER)            += webvttdec.o subtitles.o
 OBJS-$(CONFIG_WEBVTT_MUXER)              += webvttenc.o
 OBJS-$(CONFIG_WHIP_MUXER)                += webrtc.o webrtc_mux.o
 OBJS-$(CONFIG_WHEP_DEMUXER)              += webrtc.o webrtc_demux.o
+#xy:ToDo 后续配置变更成符合ffmpeg配置的方式。
+OBJS-$(CONFIG_P2P_DEMUXER)               += p2p_ws.o p2p_dc.o p2p_pc.o p2p.o p2p_probe.o p2p_rtp_demux.o
+OBJS-$(CONFIG_P2P_MUXER)                 += p2p_ws.o p2p_dc.o p2p_pc.o p2p.o p2p_probe.o p2p_rtp_mux.o
 OBJS-$(CONFIG_WSAUD_DEMUXER)             += westwood_aud.o
 OBJS-$(CONFIG_WSAUD_MUXER)               += westwood_audenc.o
 OBJS-$(CONFIG_WSD_DEMUXER)               += wsddec.o rawdec.o

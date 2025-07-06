@@ -30,7 +30,8 @@ typedef enum P2PMessageType {
 
 typedef struct P2PSignalMessage {
     P2PMessageType type;         // 消息类型
-    char* id;                    // 目标ID
+    char* sender_id;             // 发送者ID
+    char* receiver_id;           // 接收者ID
     union {
         struct {
             char* room_id;       // 房间ID
@@ -64,6 +65,8 @@ typedef struct P2PSignalMessage {
         struct {
             char* probe_id;      // 探测ID
             int packet_size;     // 探测包大小
+            int expected_packets; // 预期发送的总包数
+            int timeout_ms;      // 探测超时时间(毫秒)
         } probe_request;
         
         struct {
@@ -113,12 +116,12 @@ int p2p_handle_signal_message(P2PContext* ctx, const char* message, int size);
  * 创建基础信令消息
  * @param type 消息类型
  * @param sender_id 发送者ID
- * @param receiver_id 接收者ID（可为NULL）
- * @param room_id 房间ID（可为NULL）
+ * @param receiver_id 接收者ID
  * @return 信令消息指针，失败返回NULL
  */
 P2PSignalMessage* p2p_create_signal_message(P2PMessageType type, 
-                                            const char* sender_id);
+                                            const char* sender_id,
+                                            const char* receiver_id);
 
 /**
  * 释放信令消息内存
@@ -148,7 +151,8 @@ P2PMessageType p2p_string_to_message_type(const char* type_str);
  * @return 0表示成功，负数表示错误
  */
 int p2p_set_signal_message_handler(struct P2PContext* ctx, 
-                                   int (*handler)(struct P2PContext*, const P2PSignalMessage*),
+                                   int (*on_ws_messaged)(P2PContext*, const P2PSignalMessage*),
+                                   void (*on_pc_connected)(P2PContext*, PeerConnectionNode*),
                                    void* user_data);
 
 #endif // P2P_SIGNAL_H 
