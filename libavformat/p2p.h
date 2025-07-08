@@ -46,7 +46,7 @@ struct P2PSignalMessage;
 #define PROBE_CHANNEL_LABEL "probe_channel"  // 探测通道标签
 #define P2P_VIDEO_PAYLOAD_TYPE 96
 #define P2P_AUDIO_PAYLOAD_TYPE 97
-#define P2P_WAITING_RECEIVER_TIMEOUT_SEC 30*100//debug        // 等待拉流端超时时间(秒)
+#define P2P_WAITING_RECEIVER_TIMEOUT_SEC 10        // 等待拉流端超时时间(秒)
 
 // 带宽探测阶段
 typedef enum ProbingPhase {

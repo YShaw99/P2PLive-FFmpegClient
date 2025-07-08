@@ -26,8 +26,8 @@ void on_track_message_callback(int track, const char *message, int size, void *p
 int setup_track_common_logic(PeerConnectionNode* node,
                              PeerConnectionTrack* track,
                              int track_id,
+                             int stream_index,
                              PeerConnectionTrackType track_type);
-
 /**
  * 设置 Probe Track 专用结构与回调
  * @param node PeerConnectionNode 指针
@@ -35,7 +35,7 @@ int setup_track_common_logic(PeerConnectionNode* node,
  * @param datachannel_id DataChannel ID
  * @return 成功返回0，失败返回负数错误码
  */
-int setup_probe_common_logic(PeerConnectionNode* node,
+int setup_probe_track(PeerConnectionNode* node,
                              PeerConnectionTrack* track,
                              int datachannel_id);
 

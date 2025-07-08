@@ -223,7 +223,7 @@ void handle_probe_packet(PeerConnectionNode *node, const char *data, int size) {
                metrics->packets_received, metrics->expected_packets);
     }
     
-    av_log(node->avctx, AV_LOG_DEBUG, "[P2P-Probe] Received packet %u (%d/%d), RTT=%.2f ms, BW=%.2f kbps, Loss=%.2f%%\n", 
+    av_log(node->avctx, AV_LOG_INFO, "[P2P-Probe] Received packet %u (%d/%d), RTT=%.2f ms, BW=%.2f kbps, Loss=%.2f%%\n",
            packet->header.sequence_number, metrics->packets_received, metrics->expected_packets,
            rtt, metrics->bandwidth_kbps, metrics->packet_loss_rate * 100);
 }
@@ -306,7 +306,7 @@ void on_probe_channel_open(int dc, void *ptr) {
             return;
         }
 
-        int ret = setup_probe_common_logic(node, track, dc);
+        int ret = setup_probe_track(node, track, dc);
         if (ret < 0) {
             av_log(node->avctx, AV_LOG_ERROR, "[P2P-Probe] Failed to setup probe track for data channel %d\n", dc);
             av_freep(&track);

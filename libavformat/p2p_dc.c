@@ -22,7 +22,8 @@
 static int create_track(AVFormatContext* avctx,
                         AVStream* stream,
                         PeerConnectionNode* node,
-                        rtcTrackInit* track_init) {
+                        rtcTrackInit* track_init)
+{
     char sdp_stream[SDP_MAX_SIZE] = {0};
     char* fmtp = NULL;
     int ret;
@@ -137,58 +138,44 @@ int create_recv_track(AVFormatContext* avctx,
 int setup_track_common_logic(PeerConnectionNode* node,
                              PeerConnectionTrack* track,
                              int track_id,
+                             int stream_index,
                              PeerConnectionTrackType track_type) {
     int ret;
 
     track->avctx = node->avctx;
     track->track_id = track_id;
     track->track_type = track_type;
+    track->stream_index = stream_index;
     append_peer_connection_track_to_list(&node->track_caches, track);
 
-    // 设置回调函数
     rtcSetUserPointer(track_id, node);
-    if ((ret = rtcSetOpenCallback(track_id, on_track_open_callback)) < 0 ||
-        (ret = rtcSetErrorCallback(track_id, on_track_error_callback)) < 0 ||
-        (ret = rtcSetClosedCallback(track_id, on_track_close_callback)) < 0
-        // || (ret = rtcSetMessageCallback(track_id, on_track_message_callback)) < 0 // 设置rtcSetMessageCallback后无法通过rtcReceive主动获取。
-    ) {
-        av_log(node->avctx, AV_LOG_ERROR, "Failed to set track callback\n");
-        return AVERROR_EXTERNAL;
+    if (track_type == PeerConnectionTrackType_ProbeChannel) {
+        if ((ret = rtcSetOpenCallback(track_id, on_probe_channel_open)) < 0 ||
+            (ret = rtcSetErrorCallback(track_id, on_probe_channel_error)) < 0 ||
+            (ret = rtcSetClosedCallback(track_id, on_probe_channel_closed)) < 0 ||
+            (ret = rtcSetMessageCallback(track_id, on_probe_channel_message)) < 0 //probe track无需主动recv，所以设置回调
+        ) {
+            av_log(node->avctx, AV_LOG_ERROR, "Failed to set probe channel callback\n");
+            return AVERROR_EXTERNAL;
+        }
+    } else {
+        if ((ret = rtcSetOpenCallback(track_id, on_track_open_callback)) < 0 ||
+            (ret = rtcSetErrorCallback(track_id, on_track_error_callback)) < 0 ||
+            (ret = rtcSetClosedCallback(track_id, on_track_close_callback)) < 0
+            // || (ret = rtcSetMessageCallback(track_id, on_track_message_callback)) < 0 // 设置rtcSetMessageCallback后无法通过rtcReceive主动获取。
+        ) {
+            av_log(node->avctx, AV_LOG_ERROR, "Failed to set track callback\n");
+            return AVERROR_EXTERNAL;
+        }
     }
 
     return 0;
 }
 
-int setup_probe_common_logic(PeerConnectionNode* node,
-                             PeerConnectionTrack* track,
-                             int datachannel_id) {
-    int ret;
-    AVFormatContext* avctx = node->avctx;
-    // 初始化轨道公共属性
-
-    track->track_type = PeerConnectionTrackType_ProbeChannel;
-    track->stream_index = -1;
-    track->avctx = avctx;
-    track->track_id = datachannel_id;
-
-    append_peer_connection_track_to_list(&node->track_caches, track);
-
-    // 设置probe专用的回调函数
-    rtcSetUserPointer(datachannel_id, node);
-    if ((ret = rtcSetOpenCallback(datachannel_id, on_probe_channel_open)) < 0 ||
-        (ret = rtcSetErrorCallback(datachannel_id, on_probe_channel_error)) < 0 ||
-        (ret = rtcSetClosedCallback(datachannel_id, on_probe_channel_closed)) < 0 ||
-        (ret = rtcSetMessageCallback(datachannel_id, on_probe_channel_message)) < 0 //probe track无需主动recv，所以设置回调
-    ) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to set probe channel callback\n");
-        return AVERROR_EXTERNAL;
-    }
-
-    if (!node->probe_track) {
-        node->probe_track = track;
-    }
-
-    return 0;
+int setup_probe_track(PeerConnectionNode* node,
+                      PeerConnectionTrack* track,
+                      int datachannel_id) {
+    return setup_track_common_logic(node, track, datachannel_id, -1, PeerConnectionTrackType_ProbeChannel);
 }
 
 int init_send_track_ex(AVFormatContext* avctx,
@@ -228,9 +215,7 @@ int init_send_track_ex(AVFormatContext* avctx,
             return AVERROR(EINVAL);
     }
 
-    track->stream_index = index;
-
-    if ((ret = setup_track_common_logic(node, track, track_id, track->track_type)) < 0) {
+    if ((ret = setup_track_common_logic(node, track, track_id, index, track->track_type)) < 0) {
         goto fail;
     }
 
@@ -277,7 +262,7 @@ int init_recv_track_ex(AVFormatContext* avctx,
     //     goto fail;
     // }
 
-    if ((ret = setup_track_common_logic(node, track, track_id, track_type)) < 0) {
+    if ((ret = setup_track_common_logic(node, track, track_id, stream->index, track_type)) < 0) {
         goto fail;
     }
 
@@ -287,7 +272,8 @@ int init_recv_track_ex(AVFormatContext* avctx,
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    track->rtp_ctx->max_delay = avctx->max_delay;
+    // 对于 WebRTC P2P，尽量降低实时卡顿，禁用重排序相关等待
+    track->rtp_ctx->max_delay = 0;
     track->rtp_ctx->interrupt_callback = avctx->interrupt_callback;
 
     // 4. 初始化 SDP 文件的 IO 上下文
@@ -303,6 +289,9 @@ int init_recv_track_ex(AVFormatContext* avctx,
 
     // 5. 设置 SDP 选项, 打开 SDP 输入
     av_dict_set(&options, "sdp_flags", "custom_io", 0);
+    // 降低/禁用 RTP 抖动重排队列，避免等待缺失包导致读取卡顿
+    // 可按需改成小值（如 "32"）以在抗乱序与延迟间折中
+    av_dict_set(&options, "reorder_queue_size", "0", 0);
     infmt = av_find_input_format("sdp");
     ret = avformat_open_input(&track->rtp_ctx, "temp.sdp", infmt, &options);
     if (ret < 0) {
@@ -348,7 +337,7 @@ int init_probe_track_ex(AVFormatContext* avctx,
         return AVERROR_EXTERNAL;
     }
 
-    if ((ret = setup_probe_common_logic(node, track, datachannel_id)) < 0) {
+    if ((ret = setup_probe_track(node, track, datachannel_id)) < 0) {
         goto fail;
     }
 

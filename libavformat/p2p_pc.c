@@ -458,7 +458,7 @@ void on_pc_data_channel_callback(int peer_connection_id, int dc, void *ptr) {
     if (find_peer_connection_track_by_track_id(node->track_caches, dc) == NULL) {
         av_log(avctx, AV_LOG_WARNING, "DataChannel track not found in caches, creating new probe track for dc: %d\n", dc);
         PeerConnectionTrack* probe_track = av_mallocz(sizeof(PeerConnectionTrack));
-        setup_probe_common_logic(node, probe_track, dc);
+        setup_track_common_logic(node, probe_track, dc, -1, PeerConnectionTrackType_ProbeChannel);
     } else {
         av_log(avctx, AV_LOG_INFO, "peer_connection(local id: %d with remote id: %s) found the channel in caches! (dc_id=%d)\n", peer_connection_id, node->remote_id, dc);
     }
@@ -518,7 +518,6 @@ void on_pc_track_callback(int peer_connection_id, int tr, void *ptr) {
                         video_stream->codecpar->codec_id = AV_CODEC_ID_H264; // 默认H264
                         av_log(p2p_ctx->avctx, AV_LOG_WARNING, "Unknown codec type: %s， default H264\n", codec);
                     }
-                    track->stream_index = video_stream->index;
 
                     if ((ret = init_recv_track_ex(node->avctx, video_stream, node, track, PeerConnectionTrackType_Video, tr)) < 0) {
                         av_log(p2p_ctx->avctx, AV_LOG_ERROR, "Failed to initialize video track: %s\n", av_err2str(ret));
