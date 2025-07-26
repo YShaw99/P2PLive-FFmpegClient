@@ -465,6 +465,134 @@ static int find_missing_packets(RTPDemuxContext *s, uint16_t *first_missing,
     return 1;
 }
 
+/* --- Optional HTTP-based repair of missing RTP packets ------------------ */
+/* forward decl for enqueue_packet used by repair helpers */
+static int enqueue_packet(RTPDemuxContext *s, uint8_t *buf, int len);
+
+static int rtp_http_fetch_and_enqueue(RTPDemuxContext *s, uint16_t seq_to_fetch)
+{
+    int ret = 0;
+    char *url = NULL;
+    AVIOContext *io = NULL;
+    uint8_t *buf = NULL;
+    int rlen;
+
+    if (!s->repair_rtp_pkt_url) {
+        /* lazy init from demuxer's metadata */
+        AVDictionaryEntry *e = av_dict_get(s->ic ? s->ic->metadata : NULL,
+                                           "repair_rtp_pkt_url", NULL, 0);
+        if (e && e->value)
+            s->repair_rtp_pkt_url = av_strdup(e->value);
+    }
+    if (!s->repair_rtp_pkt_url)
+        return 0;
+
+    url = av_asprintf(s->repair_rtp_pkt_url, (unsigned)seq_to_fetch);
+    if (!url)
+        return 0;
+
+    av_log(s->ic, AV_LOG_ERROR, "[rtpdec] trying HTTP repair for seq=%u via %s\n",
+           seq_to_fetch, url);
+
+    {
+        AVDictionary *opts = NULL;
+        /* optional timeout (ms) from container metadata: repair_http_timeout_ms */
+        AVDictionaryEntry *te = av_dict_get(s->ic ? s->ic->metadata : NULL,
+                                            "repair_http_timeout_ms", NULL, 0);
+        if (te && te->value) {
+            int64_t ms = strtoll(te->value, NULL, 10);
+            char tmp[32];
+            /* rw_timeout is in microseconds */
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)(ms * 1000LL));
+            av_dict_set(&opts, "rw_timeout", tmp, 0);
+        }
+        ret = avio_open2(&io, url, AVIO_FLAG_READ, NULL, &opts);
+        av_dict_free(&opts);
+    }
+    if (ret < 0) {
+        av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repair open failed: %s\n", av_err2str(ret));
+        av_freep(&url);
+        return 0;
+    }
+
+    buf = av_malloc(RTP_MAX_PACKET_LENGTH);
+    if (!buf) {
+        avio_close(io);
+        av_freep(&url);
+        return 0;
+    }
+
+    rlen = avio_read(io, buf, RTP_MAX_PACKET_LENGTH);
+    avio_close(io);
+    av_freep(&url);
+
+    if (rlen < 12) {
+        av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repair read too short: %d\n", rlen);
+        av_free(buf);
+        return 0;
+    }
+    if ((buf[0] & 0xc0) != (RTP_VERSION << 6)) {
+        av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repair invalid RTP header: 0x%02x\n", buf[0]);
+        av_free(buf);
+        return 0;
+    }
+
+    /* Verify sequence, optionally SSRC; log timestamp */
+    {
+        uint16_t got_seq = AV_RB16(buf + 2);
+        uint32_t got_ts  = AV_RB32(buf + 4);
+        uint32_t got_ssrc = AV_RB32(buf + 8);
+        if (got_seq != seq_to_fetch) {
+            av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repair seq mismatch: requested=%u got=%u\n",
+                   seq_to_fetch, got_seq);
+        }
+        if (s->ssrc && got_ssrc != s->ssrc) {
+            av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repair SSRC mismatch: expected=%08x got=%08x, drop\n",
+                   s->ssrc, got_ssrc);
+            av_free(buf);
+            return 0;
+        }
+        av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repair RTP ts=%u for seq=%u\n", got_ts, got_seq);
+    }
+
+    if ((ret = enqueue_packet(s, buf, rlen)) < 0) {
+        av_log(s->ic, AV_LOG_ERROR, "[rtpdec] enqueue repaired packet failed: %s\n", av_err2str(ret));
+        av_free(buf);
+        return 0;
+    }
+
+    av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repaired via SRS and enqueued RTP seq=%u\n", seq_to_fetch);
+    return 1;
+}
+
+static int rtp_try_http_repair(RTPDemuxContext *s)
+{
+    int repaired = 0;
+    uint16_t first_missing = 0, missing_mask = 0;
+    int64_t now = av_gettime_relative();
+
+    /* basic throttling to avoid spamming repair endpoint */
+    if (s->last_repair_time && (now - s->last_repair_time) < MIN_FEEDBACK_INTERVAL)
+        return 0;
+
+    if (!find_missing_packets(s, &first_missing, &missing_mask))
+        return 0;
+
+    repaired += rtp_http_fetch_and_enqueue(s, first_missing);
+    /* Walk through the 16-bit mask for additional gaps */
+    for (int i = 1; i <= 16; i++) {
+        if (missing_mask & (1u << (i - 1))) {
+            uint16_t seq = first_missing + i;
+            repaired += rtp_http_fetch_and_enqueue(s, seq);
+        }
+    }
+
+    if (repaired > 0)
+        s->last_repair_time = now;
+
+    return repaired;
+}
+
 int ff_rtp_send_rtcp_feedback(RTPDemuxContext *s, URLContext *fd,
                               AVIOContext *avio)
 {
@@ -614,6 +742,15 @@ RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
     }
     // needed to send back RTCP RR in RTSP sessions
     gethostname(s->hostname, sizeof(s->hostname));
+    /* Optional: allow configuring repair_rtp_pkt_url via format options or metadata. */
+    s->repair_rtp_pkt_url = NULL;
+    s->last_repair_time = 0;
+    {
+        AVDictionaryEntry *e = av_dict_get(s1 ? s1->metadata : NULL,
+                                           "repair_rtp_pkt_url", NULL, 0);
+        if (e && e->value)
+            s->repair_rtp_pkt_url = av_strdup(e->value);
+    }
     return s;
 }
 
@@ -660,6 +797,9 @@ static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestam
     if (timestamp == RTP_NOTS_VALUE)
         return;
 
+    // av_log(s->ic, AV_LOG_INFO, "[rtpdec] xy: RTP timestamp conversion: rtp_ts=%u, base_ts=%u\n",
+    //        timestamp, s->base_timestamp);
+
     if (s->last_rtcp_ntp_time != AV_NOPTS_VALUE) {
         if (rtp_set_prft(s, pkt, timestamp) < 0) {
             av_log(s->ic, AV_LOG_WARNING, "rtpdec: failed to set prft");
@@ -678,6 +818,9 @@ static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestam
                             (uint64_t) s->st->time_base.num << 32);
         pkt->pts = s->range_start_offset + s->rtcp_ts_offset + addend +
                    delta_timestamp;
+
+        // av_log(s->ic, AV_LOG_INFO, "[rtpdec] xy: RTP->PTS (RTCP sync): rtp_ts=%u -> pts=%ld, delta_ts=%d\n",
+        //        timestamp, pkt->pts, delta_timestamp);
         return;
     }
 
@@ -692,6 +835,10 @@ static void finalize_packet(RTPDemuxContext *s, AVPacket *pkt, uint32_t timestam
     s->timestamp = timestamp;
     pkt->pts     = s->unwrapped_timestamp + s->range_start_offset -
                    s->base_timestamp;
+
+    // 添加基础时间戳转换日志
+    // av_log(s->ic, AV_LOG_INFO, "[rtpdec] xy: RTP->PTS (basic): rtp_ts=%u -> pts=%ld, unwrapped=%ld\n",
+    //        timestamp, pkt->pts, s->unwrapped_timestamp);
 }
 
 static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
@@ -774,6 +921,8 @@ static int rtp_parse_packet_internal(RTPDemuxContext *s, AVPacket *pkt,
     // now perform timestamp things....
     finalize_packet(s, pkt, timestamp);
 
+    // av_log(s->ic, AV_LOG_INFO, "[rtpdec] xy: RTP: seq=%d ts=%u pts=%lld ssrc=%u payload_type=%d\n",
+    //        seq, timestamp, pkt->pts, ssrc, payload_type);
     return rv;
 }
 
@@ -921,6 +1070,9 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
             if (rv < 0)
                 return rv;
             *bufptr = NULL;
+
+            /* Try HTTP repair for the missing gap in the jitter queue */
+            // rtp_try_http_repair(s);
             /* Return the first enqueued packet if the queue is full,
              * even if we're missing something */
             if (s->queue_len >= s->queue_size) {

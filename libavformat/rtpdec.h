@@ -188,6 +188,20 @@ struct RTPDemuxContext {
     /* dynamic payload stuff */
     const RTPDynamicProtocolHandler *handler;
     PayloadContext *dynamic_protocol_context;
+
+    /* --- P2P/repair: optional HTTP repair for missing RTP packets --- */
+    /**
+     * If set (non-NULL), a printf-style template URL used to request repairing
+     * a specific missing RTP packet by sequence number. The template must
+     * contain exactly one "%u" placeholder where the 16-bit sequence number
+     * will be formatted, e.g.:
+     *   "http://127.0.0.1:1985/rtc/v1/repair/?app=live&stream=xytest&kind=video&seq=%u"
+     * When missing is detected, rtpdec may synchronously fetch the missing RTP
+     * packet via HTTP and inject it into the reordering queue.
+     */
+    char *repair_rtp_pkt_url;
+    /** Throttling to avoid excessive repair requests (microseconds). */
+    int64_t last_repair_time;
 };
 
 /**

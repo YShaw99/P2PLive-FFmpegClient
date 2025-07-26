@@ -1023,6 +1023,25 @@ static int commit_pending_switch_if_ready(P2PRtpDemuxContext *ctx, AVPacket *out
 
     if (ctx->sw.pending_switch == SWITCH_TO_P2P) {
         ctx->sw.active_source = ACTIVE_P2P;
+        
+        if (ctx->repair_rtp_pkt_host && ctx->repair_rtp_pkt_host[0] &&
+            ctx->repair_rtp_pkt_port > 0 &&
+            ctx->room && ctx->room[0]) {
+            PeerConnectionTrack* track = ctx->p2p_context.selected_node->video_track;
+            AVDictionaryEntry *e = av_dict_get(track->rtp_ctx->metadata, "repair_rtp_pkt_url", NULL, 0);
+            if (!e || !e->value) {
+                char *tpl = av_asprintf("http://%s:%d/rtc/v1/repair/?app=%s&stream=%s&kind=video&seq=%%u", ctx->repair_rtp_pkt_host, ctx->repair_rtp_pkt_port, P2P_CDN_URL_REPAIR_APP, ctx->room);
+                if (tpl) {
+                    av_dict_set(&track->rtp_ctx->metadata, "repair_rtp_pkt_url", tpl, AV_DICT_DONT_STRDUP_VAL);
+                }
+
+                if (ctx->repair_http_timeout_ms > 0) {
+                    char timeout_str[32];
+                    snprintf(timeout_str, sizeof(timeout_str), "%lld", (long long)ctx->repair_http_timeout_ms);
+                    av_dict_set(&track->rtp_ctx->metadata, "repair_http_timeout_ms", timeout_str, 0);
+                }
+            }
+        }
     }
     else if (ctx->sw.pending_switch == SWITCH_TO_CDN) {
         ctx->sw.active_source = ACTIVE_CDN;
