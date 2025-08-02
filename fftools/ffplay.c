@@ -46,7 +46,9 @@
 #include "libavformat/avformat.h"
 #include "libavdevice/avdevice.h"
 #include "libswscale/swscale.h"
+#include "libavcodec/avcodec.h"
 #include "libavutil/opt.h"
+#include "libavutil/error.h"
 #include "libavutil/tx.h"
 #include "libswresample/swresample.h"
 
@@ -304,6 +306,33 @@ typedef struct VideoState {
     SDL_cond *continue_read_thread;
 } VideoState;
 
+typedef struct OutputState {
+    int enabled;
+    AVFormatContext *oc;
+    int header_written;
+
+    int stream_mapping_size;
+    int *stream_mapping; // input index -> output index
+
+    int video_in_index;
+    int audio_in_index;
+    int video_out_index;
+    int audio_out_index;
+
+    int use_copy_video;
+    int use_copy_audio;
+    int force_encode_video; // set to 1 when param-change detected
+
+    const AVCodec *video_enc;
+    AVCodecContext *video_enc_ctx;
+
+    SDL_mutex *mutex; // protect write_frame on oc
+
+    // DTS monotonic tracking per output stream
+    int last_dts_count;
+    int64_t *last_dts; // in ost->time_base
+} OutputState;
+
 /* options specified by the user */
 static const AVInputFormat *file_iformat;
 static const char *input_filename;
@@ -354,6 +383,11 @@ static int filter_nbthreads = 0;
 static int enable_vulkan = 0;
 static char *vulkan_params = NULL;
 static const char *hwaccel = NULL;
+static int enable_streaming = 0;
+static const char *output_format_name = NULL;
+static const char *output_room = NULL;
+
+static OutputState g_output = {0};
 
 /* current context */
 static int is_full_screen;
@@ -561,6 +595,328 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *seria
     }
     SDL_UnlockMutex(q->mutex);
     return ret;
+}
+
+
+static int output_init_from_input(OutputState *o, AVFormatContext *ic)
+{
+    int ret = 0;
+    AVFormatContext *oc = NULL;
+
+    if (!enable_streaming || !output_format_name)
+        return 0;
+
+    if (o->oc)
+        return 0;
+
+    ret = avformat_alloc_output_context2(&oc, NULL, output_format_name, NULL);
+    if (ret < 0 || !oc)
+        return ret < 0 ? ret : AVERROR(ENOMEM);
+
+    o->oc = oc;
+    o->enabled = 1;
+    o->header_written = 0;
+    o->video_in_index = -1;
+    o->audio_in_index = -1;
+    o->video_out_index = -1;
+    o->audio_out_index = -1;
+    o->use_copy_video = 1;
+    o->use_copy_audio = 1;
+    o->force_encode_video = 0;
+    o->mutex = SDL_CreateMutex();
+    if (!o->mutex)
+        return AVERROR(ENOMEM);
+
+    o->stream_mapping_size = ic->nb_streams;
+    o->stream_mapping = av_calloc(o->stream_mapping_size, sizeof(int));
+    if (!o->stream_mapping)
+        return AVERROR(ENOMEM);
+    for (int i = 0; i < o->stream_mapping_size; i++)
+        o->stream_mapping[i] = -1;
+
+    // Create output streams for selected input streams (audio/video selected by ffplay)
+    for (unsigned i = 0; i < ic->nb_streams; i++) {
+        AVStream *ist = ic->streams[i];
+        AVCodecParameters *par = ist->codecpar;
+        if (par->codec_type != AVMEDIA_TYPE_AUDIO && par->codec_type != AVMEDIA_TYPE_VIDEO)
+            continue;
+
+        AVStream *ost = avformat_new_stream(oc, NULL);
+        if (!ost)
+            return AVERROR(ENOMEM);
+
+        int map_to = ost->index;
+        o->stream_mapping[i] = map_to;
+
+        // Default: stream copy parameters
+        ret = avcodec_parameters_copy(ost->codecpar, par);
+        if (ret < 0)
+            return ret;
+
+        ost->time_base = ist->time_base.num && ist->time_base.den ? ist->time_base : (AVRational){1, 90000};
+
+        if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+            o->video_in_index = i;
+            o->video_out_index = ost->index;
+        } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+            o->audio_in_index = i;
+            o->audio_out_index = ost->index;
+        }
+    }
+
+    if (oc->oformat->flags & AVFMT_GLOBALHEADER)
+        ; // nothing to do here for copy mode; encoder ctx will set flags later if used
+
+    // allocate last_dts for all output streams
+    o->last_dts_count = o->oc->nb_streams;
+    o->last_dts = av_calloc(o->last_dts_count, sizeof(int64_t));
+    if (!o->last_dts)
+        return AVERROR(ENOMEM);
+    for (int i = 0; i < o->last_dts_count; i++)
+        o->last_dts[i] = AV_NOPTS_VALUE;
+
+    return 0;
+}
+
+static int output_write_header_if_needed(OutputState *o)
+{
+    int ret;
+    if (!o->enabled || o->header_written || !o->oc)
+        return 0;
+
+    // Many custom muxers use NOFILE and open networks internally
+    if (!(o->oc->oformat->flags & AVFMT_NOFILE) && !o->oc->pb) {
+        // No URL specified; rely on muxer to not require AVIO
+    }
+
+    if (output_room)
+        av_dict_set(&o->oc->metadata, "room", output_room, 0);
+
+    AVDictionary *opts = NULL;
+    if (enable_streaming)
+        av_dict_set(&opts, "enable_streaming", "1", 0);
+    if (output_room)
+        av_dict_set(&opts, "room", output_room, 0);
+
+    ret = avformat_write_header(o->oc, &opts);
+    av_dict_free(&opts);
+    if (ret < 0)
+        return ret;
+    o->header_written = 1;
+    return 0;
+}
+
+static int output_write_packet_copy(OutputState *o, AVFormatContext *ic, AVPacket *pkt)
+{
+    if (!o->enabled || !o->oc || !o->use_copy_video && pkt->stream_index == o->video_in_index)
+        return 0;
+
+    int out_idx = (pkt->stream_index >= 0 && pkt->stream_index < o->stream_mapping_size)
+                  ? o->stream_mapping[pkt->stream_index] : -1;
+    if (out_idx < 0)
+        return 0;
+
+    AVStream *ist = ic->streams[pkt->stream_index];
+    AVStream *ost = o->oc->streams[out_idx];
+
+    AVPacket opkt;
+    av_init_packet(&opkt);
+    int ret = av_packet_ref(&opkt, pkt);
+    if (ret < 0)
+        return ret;
+    opkt.stream_index = out_idx;
+    opkt.pts = (opkt.pts == AV_NOPTS_VALUE) ? AV_NOPTS_VALUE : av_rescale_q(opkt.pts, ist->time_base, ost->time_base);
+    opkt.dts = (opkt.dts == AV_NOPTS_VALUE) ? AV_NOPTS_VALUE : av_rescale_q(opkt.dts, ist->time_base, ost->time_base);
+    if (opkt.duration > 0)
+        opkt.duration = av_rescale_q(opkt.duration, ist->time_base, ost->time_base);
+
+    // Ensure DTS/PTS exist and are monotonic
+    int64_t *plast = (out_idx < o->last_dts_count) ? &o->last_dts[out_idx] : NULL;
+    if (opkt.dts == AV_NOPTS_VALUE && opkt.pts != AV_NOPTS_VALUE)
+        opkt.dts = opkt.pts;
+    if (opkt.pts == AV_NOPTS_VALUE && opkt.dts != AV_NOPTS_VALUE)
+        opkt.pts = opkt.dts;
+    if (plast && opkt.dts != AV_NOPTS_VALUE) {
+        if (*plast != AV_NOPTS_VALUE && opkt.dts <= *plast) {
+            int64_t bump = (*plast + (opkt.duration > 0 ? opkt.duration : 1)) - opkt.dts;
+            opkt.dts += bump;
+            if (opkt.pts != AV_NOPTS_VALUE)
+                opkt.pts += bump;
+        }
+    }
+
+    // SDL_LockMutex(o->mutex);
+    ret = output_write_header_if_needed(o);
+    if (ret >= 0)
+        ret = av_interleaved_write_frame(o->oc, &opkt);
+    // SDL_UnlockMutex(o->mutex);
+
+    if (plast && opkt.dts != AV_NOPTS_VALUE && ret >= 0)
+        *plast = opkt.dts;
+    av_packet_unref(&opkt);
+    return ret;
+}
+
+static int output_prepare_video_encoder(OutputState *o, AVCodecContext *ref_dec_ctx, AVFrame *frame)
+{
+    if (!o->enabled || !o->oc)
+        return 0;
+    if (o->video_enc_ctx)
+        return 0;
+
+    const AVCodec *enc = NULL;
+    // Prefer same codec id as decoder, else try H264
+    if (ref_dec_ctx)
+        enc = avcodec_find_encoder(ref_dec_ctx->codec_id);
+    if (!enc)
+        enc = avcodec_find_encoder_by_name("libx264");
+    if (!enc)
+        enc = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!enc)
+        return AVERROR_ENCODER_NOT_FOUND;
+
+    AVCodecContext *ctx = avcodec_alloc_context3(enc);
+    if (!ctx)
+        return AVERROR(ENOMEM);
+
+    // Basic parameters from current frame
+    if (frame) {
+        ctx->width = frame->width;
+        ctx->height = frame->height;
+        ctx->pix_fmt = frame->format >= 0 ? (enum AVPixelFormat)frame->format : AV_PIX_FMT_YUV420P;
+    } else if (ref_dec_ctx) {
+        ctx->width = ref_dec_ctx->width;
+        ctx->height = ref_dec_ctx->height;
+        ctx->pix_fmt = ref_dec_ctx->pix_fmt;
+    }
+    if (!ctx->width || !ctx->height)
+        ctx->width = ctx->height = 0; // will fail later if invalid
+
+    ctx->time_base = (AVRational){1, 90000};
+    ctx->framerate = (AVRational){0, 1};
+
+    if (o->oc->oformat->flags & AVFMT_GLOBALHEADER)
+        ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    int ret = avcodec_open2(ctx, enc, NULL);
+    if (ret < 0) {
+        avcodec_free_context(&ctx);
+        return ret;
+    }
+
+    o->video_enc = enc;
+    o->video_enc_ctx = ctx;
+    o->use_copy_video = 0;
+    o->force_encode_video = 1;
+
+    // Update output stream codecpar if possible
+    if (o->video_out_index >= 0) {
+        AVStream *ost = o->oc->streams[o->video_out_index];
+        avcodec_parameters_from_context(ost->codecpar, ctx);
+        ost->time_base = ctx->time_base;
+    }
+    return 0;
+}
+
+static int output_encode_and_write_video(OutputState *o, AVFrame *frame, AVRational src_tb)
+{
+    if (!o->enabled || !o->video_enc_ctx)
+        return 0;
+    int ret = 0;
+    AVCodecContext *enc = o->video_enc_ctx;
+
+    if (frame) {
+        AVFrame *f = av_frame_alloc();
+        if (!f)
+            return AVERROR(ENOMEM);
+        ret = av_frame_ref(f, frame);
+        if (ret < 0) {
+            av_frame_free(&f);
+            return ret;
+        }
+        if (f->pts != AV_NOPTS_VALUE)
+            f->pts = av_rescale_q(f->pts, src_tb, enc->time_base);
+        ret = avcodec_send_frame(enc, f);
+        av_frame_free(&f);
+    } else {
+        ret = avcodec_send_frame(enc, NULL);
+    }
+    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+        return ret;
+
+    for (;;) {
+        AVPacket opkt;
+        av_init_packet(&opkt);
+        ret = avcodec_receive_packet(enc, &opkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            ret = 0;
+            break;
+        }
+        if (ret < 0)
+            break;
+
+        opkt.stream_index = o->video_out_index;
+        // enc->time_base -> stream time_base
+        AVStream *ost = o->oc->streams[o->video_out_index];
+        opkt.pts = (opkt.pts == AV_NOPTS_VALUE) ? AV_NOPTS_VALUE : av_rescale_q(opkt.pts, enc->time_base, ost->time_base);
+        opkt.dts = (opkt.dts == AV_NOPTS_VALUE) ? AV_NOPTS_VALUE : av_rescale_q(opkt.dts, enc->time_base, ost->time_base);
+        if (opkt.duration > 0)
+            opkt.duration = av_rescale_q(opkt.duration, enc->time_base, ost->time_base);
+
+        SDL_LockMutex(o->mutex);
+        int wh = output_write_header_if_needed(o);
+        if (wh >= 0)
+            ret = av_interleaved_write_frame(o->oc, &opkt);
+        SDL_UnlockMutex(o->mutex);
+        av_packet_unref(&opkt);
+        if (ret < 0)
+            break;
+    }
+    return ret;
+}
+
+static void output_flush_and_close(OutputState *o)
+{
+    if (!o || !o->enabled)
+        goto cleanup_state;
+
+    if (o->video_enc_ctx) {
+        // flush encoder
+        AVRational tmp = {0, 0};
+        output_encode_and_write_video(o, NULL, tmp);
+    }
+
+    if (o->oc) {
+        SDL_LockMutex(o->mutex);
+        if (!o->header_written) {
+            // write empty header to allow trailer
+            output_write_header_if_needed(o);
+        }
+        if (o->header_written)
+            av_write_trailer(o->oc);
+        SDL_UnlockMutex(o->mutex);
+    }
+
+cleanup_state:
+    if (o->video_enc_ctx) {
+        avcodec_free_context(&o->video_enc_ctx);
+        o->video_enc_ctx = NULL;
+    }
+    if (o->oc) {
+        if (!(o->oc->oformat->flags & AVFMT_NOFILE) && o->oc->pb)
+            avio_closep(&o->oc->pb);
+        avformat_free_context(o->oc);
+        o->oc = NULL;
+    }
+    av_freep(&o->stream_mapping);
+    o->stream_mapping_size = 0;
+    av_freep(&o->last_dts);
+    o->last_dts_count = 0;
+    if (o->mutex) {
+        SDL_DestroyMutex(o->mutex);
+        o->mutex = NULL;
+    }
+    memset(o, 0, sizeof(*o));
 }
 
 static int decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, SDL_cond *empty_queue_cond) {
@@ -1304,6 +1660,7 @@ static void do_exit(VideoState *is)
         vk_renderer_destroy(vk_renderer);
     if (window)
         SDL_DestroyWindow(window);
+    output_flush_and_close(&g_output);
     uninit_opts();
     av_freep(&vfilters_list);
     avformat_network_deinit();
@@ -1714,17 +2071,17 @@ display:
                 av_diff = get_master_clock(is) - get_clock(&is->audclk);
 
             av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
-            av_bprintf(&buf,
-                      "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
-                      get_master_clock(is),
-                      (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
-                      av_diff,
-                      is->frame_drops_early + is->frame_drops_late,
-                      aqsize / 1024,
-                      vqsize / 1024,
-                      sqsize,
-                      is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
-                      is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
+            // av_bprintf(&buf,
+            //           "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
+            //           get_master_clock(is),
+            //           (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
+            //           av_diff,
+            //           is->frame_drops_early + is->frame_drops_late,
+            //           aqsize / 1024,
+            //           vqsize / 1024,
+            //           sqsize,
+            //           is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
+            //           is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
 
             if (show_status == 1 && AV_LOG_INFO > av_log_get_level())
                 fprintf(stderr, "%s", buf.str);
@@ -2213,6 +2570,17 @@ static int video_thread(void *arg)
             tb = av_buffersink_get_time_base(filt_out);
             duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
             pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
+            if (enable_streaming && g_output.enabled) {
+                if (g_output.force_encode_video || !g_output.use_copy_video) {
+                    if (!g_output.video_enc_ctx) {
+                        int rpe = output_prepare_video_encoder(&g_output, is->viddec.avctx, frame);
+                        if (rpe < 0)
+                            av_log(NULL, AV_LOG_WARNING, "prepare encoder failed: %s\n", av_err2str(rpe));
+                    }
+                    output_encode_and_write_video(&g_output, frame, tb);
+                }
+            }
+
             ret = queue_picture(is, frame, pts, duration, fd ? fd->pkt_pos : -1, is->viddec.pkt_serial);
             av_frame_unref(frame);
             if (is->videoq.serial != is->viddec.pkt_serial)
@@ -2903,6 +3271,11 @@ static int read_thread(void *arg)
     if (show_status)
         av_dump_format(ic, 0, is->filename, 0);
 
+    ret = output_init_from_input(&g_output, ic);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "init output failed: %s\n", av_err2str(ret));
+    }
+
     for (i = 0; i < ic->nb_streams; i++) {
         AVStream *st = ic->streams[i];
         enum AVMediaType type = st->codecpar->codec_type;
@@ -3056,6 +3429,7 @@ static int read_thread(void *arg)
         }
         ret = av_read_frame(ic, pkt);
         if (ret < 0) {
+            av_log(NULL, AV_LOG_DEBUG, "Error while reading: %s\n", av_err2str(ret));
             if ((ret == AVERROR_EOF || avio_feof(ic->pb)) && !is->eof) {
                 if (is->video_stream >= 0)
                     packet_queue_put_nullpacket(&is->videoq, pkt, is->video_stream);
@@ -3087,9 +3461,32 @@ static int read_thread(void *arg)
                 (double)(start_time != AV_NOPTS_VALUE ? start_time : 0) / 1000000
                 <= ((double)duration / 1000000);
         if (pkt->stream_index == is->audio_stream && pkt_in_play_range) {
+            if (g_output.enabled)
+                output_write_packet_copy(&g_output, ic, pkt);
             packet_queue_put(&is->audioq, pkt);
         } else if (pkt->stream_index == is->video_stream && pkt_in_play_range
                    && !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            if (g_output.enabled) {
+                int is_param_change = 0;
+                for (int si = 0; si < pkt->side_data_elems; si++) {
+                    if (pkt->side_data[si].type == AV_PKT_DATA_PARAM_CHANGE ||
+                        pkt->side_data[si].type == AV_PKT_DATA_NEW_EXTRADATA ||
+                        pkt->side_data[si].type == AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL) {
+                        is_param_change = 1;
+                        break;
+                    }
+                }
+                if (!g_output.force_encode_video && is_param_change) {
+                    if (is->viddec.avctx) {
+                        int r2 = output_prepare_video_encoder(&g_output, is->viddec.avctx, NULL);
+                        if (r2 < 0)
+                            av_log(NULL, AV_LOG_WARNING, "prepare encoder failed: %s\n", av_err2str(r2));
+                    }
+                }
+                if (g_output.use_copy_video) {
+                    output_write_packet_copy(&g_output, ic, pkt);
+                }
+            }
             packet_queue_put(&is->videoq, pkt);
         } else if (pkt->stream_index == is->subtitle_stream && pkt_in_play_range) {
             packet_queue_put(&is->subtitleq, pkt);
@@ -3666,6 +4063,9 @@ static const OptionDef options[] = {
     { "enable_vulkan", OPT_BOOL, { &enable_vulkan }, "enable vulkan renderer" },
     { "vulkan_params", HAS_ARG | OPT_STRING | OPT_EXPERT, { &vulkan_params }, "vulkan configuration using a list of key=value pairs separated by ':'" },
     { "hwaccel", HAS_ARG | OPT_STRING | OPT_EXPERT, { &hwaccel }, "use HW accelerated decoding" },
+    { "enable_streaming", OPT_BOOL, { &enable_streaming }, "enable streaming output (copy->mux or encode)" },
+    { "output_format", HAS_ARG | OPT_STRING, { &output_format_name }, "set muxer/format name for output (e.g. p2pmuxer)" },
+    { "room", HAS_ARG | OPT_STRING, { &output_room }, "set room name for output muxer" },
     { NULL, },
 };
 
