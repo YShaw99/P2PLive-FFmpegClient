@@ -202,6 +202,10 @@ struct RTPDemuxContext {
     char *repair_rtp_pkt_url;
     /** Throttling to avoid excessive repair requests (microseconds). */
     int64_t last_repair_time;
+
+    /* Repair statistics */
+    int64_t repair_attempts;   /* denominator: total packets attempted to repair */
+    int64_t repair_successes;  /* numerator: successfully repaired packets */
 };
 
 /**

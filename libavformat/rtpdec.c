@@ -561,7 +561,10 @@ static int rtp_http_fetch_and_enqueue(RTPDemuxContext *s, uint16_t seq_to_fetch)
         return 0;
     }
 
-    av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repaired via SRS and enqueued RTP seq=%u\n", seq_to_fetch);
+    /* success: count numerator */
+    s->repair_successes++;
+    av_log(s->ic, AV_LOG_ERROR, "[rtpdec] repaired via HTTP and enqueued RTP seq=%u (success %lld/%lld)\n",
+           seq_to_fetch, (long long)s->repair_successes, (long long)s->repair_attempts);
     return 1;
 }
 
@@ -577,6 +580,16 @@ static int rtp_try_http_repair(RTPDemuxContext *s)
 
     if (!find_missing_packets(s, &first_missing, &missing_mask))
         return 0;
+
+    /* count denominator: how many packets we'll attempt */
+    int attempts = 0;
+    attempts++; /* first_missing */
+    for (int i = 1; i <= 16; i++) {
+        if (missing_mask & (1u << (i - 1))) attempts++;
+    }
+    s->repair_attempts += attempts;
+    av_log(s->ic, AV_LOG_ERROR, "[rtpdec] HTTP repair attempt: missing window first=%u mask=0x%04x, total_attempts_now=%lld (this_batch=%d)\n",
+           first_missing, missing_mask, (long long)s->repair_attempts, attempts);
 
     repaired += rtp_http_fetch_and_enqueue(s, first_missing);
     /* Walk through the 16-bit mask for additional gaps */
@@ -745,6 +758,8 @@ RTPDemuxContext *ff_rtp_parse_open(AVFormatContext *s1, AVStream *st,
     /* Optional: allow configuring repair_rtp_pkt_url via format options or metadata. */
     s->repair_rtp_pkt_url = NULL;
     s->last_repair_time = 0;
+    s->repair_attempts = 0;
+    s->repair_successes = 0;
     {
         AVDictionaryEntry *e = av_dict_get(s1 ? s1->metadata : NULL,
                                            "repair_rtp_pkt_url", NULL, 0);
@@ -1108,6 +1123,16 @@ int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
 
 void ff_rtp_parse_close(RTPDemuxContext *s)
 {
+    if (s && s->ic) {
+        if (s->repair_attempts > 0) {
+            double rate = (double)s->repair_successes / (double)s->repair_attempts;
+            av_log(s->ic, AV_LOG_ERROR,
+                   "[rtpdec] HTTP repair summary: success=%lld attempts=%lld rate=%.2f\n",
+                   (long long)s->repair_successes, (long long)s->repair_attempts, rate);
+        } else {
+            av_log(s->ic, AV_LOG_ERROR, "[rtpdec] HTTP repair summary: no attempts\n");
+        }
+    }
     ff_rtp_reset_packet_queue(s);
     ff_srtp_free(&s->srtp);
     av_free(s);
