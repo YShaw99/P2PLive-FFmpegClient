@@ -6,9 +6,9 @@ P2P-FFmpeg-Client README
 * 观众拉流预览客户端：`ffplay -f p2pdemuxer -i "http://host:port/rtc/v1/whep/?app=live&unified_timestamp=1&stream=default_room" -room default_room`
 
 
-编译环境：MacOS Arm64, Apple clang version 15.0.0
-依赖：libdatachannel
-编译参数：`"--enable-gpl --enable-nonfree --enable-debug=3 --enable-libx264 --enable-libdatachannel --disable-optimizations --disable-asm --disable-stripping --arch=arm --extra-ldflags='-L/opt/homebrew/lib -lcjson -ldatachannel -Wl,-rpath' --extra-cxxflags='-std=c++20'"`
+* 编译环境：MacOS Arm64, Apple clang version 15.0.0
+* 依赖：libdatachannel
+* 编译参数：`"--enable-gpl --enable-nonfree --enable-debug=3 --enable-libx264 --enable-libdatachannel --disable-optimizations --disable-asm --disable-stripping --arch=arm --extra-ldflags='-L/opt/homebrew/lib -lcjson -ldatachannel -Wl,-rpath' --extra-cxxflags='-std=c++20'"`
 
 ## 注：
 `unified_timestamp=1`需要配合流媒体服务器支持统一RTP时间戳需求，请参考：[P2PLive-srs](https://github.com/YShaw99/P2PLive-srs)
@@ -19,6 +19,9 @@ P2P-FFmpeg-Client README
 * 观众侧卡顿优化——目前存在并行任务导致初期渲染卡顿，同时CDN切换P2P后应暂停CDN流，浪费带宽占用
 * 补片时间戳修复——观众侧推流端会重置时间戳，导致观众拉流侧无法使用补片接口。
 
+
+## Demo演示:
+![Demo GIF](./demo.gif)
 
 FFmpeg README
 =============
